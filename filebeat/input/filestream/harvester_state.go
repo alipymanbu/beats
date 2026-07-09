@@ -29,6 +29,7 @@ import (
 type fileStateTable struct {
 	mu      sync.Mutex
 	entries map[string]*openFileState
+	byPath  map[string]*openFileState
 }
 
 // openFileState shares one open file's state with the scanner.
@@ -49,6 +50,7 @@ type openFileState struct {
 func newFileStateTable() *fileStateTable {
 	return &fileStateTable{
 		entries: make(map[string]*openFileState),
+		byPath:  make(map[string]*openFileState),
 	}
 }
 
@@ -67,6 +69,9 @@ func (t *fileStateTable) Register(name string, desc loginp.FileDescriptor) *open
 
 	t.mu.Lock()
 	t.entries[name] = h
+	if desc.Filename != "" {
+		t.byPath[desc.Filename] = h
+	}
 	t.mu.Unlock()
 
 	return h
@@ -82,6 +87,9 @@ func (t *fileStateTable) Deregister(h *openFileState) {
 	if t.entries[h.name] == h {
 		delete(t.entries, h.name)
 	}
+	if d := h.desc.Load(); t.byPath[d.Filename] == h {
+		delete(t.byPath, d.Filename)
+	}
 	t.mu.Unlock()
 }
 
@@ -93,13 +101,21 @@ func (t *fileStateTable) UpdateDescriptor(name string, desc loginp.FileDescripto
 	}
 
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	h, ok := t.entries[name]
-	t.mu.Unlock()
 	if !ok {
 		return
 	}
 
 	d := desc // copy
+	if old := h.desc.Load().Filename; old != d.Filename {
+		if t.byPath[old] == h {
+			delete(t.byPath, old)
+		}
+		if d.Filename != "" {
+			t.byPath[d.Filename] = h
+		}
+	}
 	h.desc.Store(&d)
 }
 
@@ -119,6 +135,22 @@ func (t *fileStateTable) LookupOSState(name string) (file.StateOS, bool) {
 		return file.StateOS{}, false
 	}
 	return h.os, true
+}
+
+// PinnedDescriptor returns the descriptor and file identity for an open harvester.
+// It returns ok=false if the path has no pinned harvester.
+func (t *fileStateTable) PinnedDescriptor(path string) (desc loginp.FileDescriptor, pin file.StateOS, ok bool) {
+	if t == nil {
+		return loginp.FileDescriptor{}, file.StateOS{}, false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	h, ok := t.byPath[path]
+	if !ok || h.os == (file.StateOS{}) {
+		return loginp.FileDescriptor{}, file.StateOS{}, false
+	}
+	return *h.desc.Load(), h.os, true
 }
 
 // PinOSState records the open file identity from fstat.
