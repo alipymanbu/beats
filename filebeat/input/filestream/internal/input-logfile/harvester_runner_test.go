@@ -21,6 +21,7 @@ package input_logfile
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -951,6 +952,101 @@ func TestHarvesterRunner_MigrateSkipsFinishedSource(t *testing.T) {
 	assert.False(t, g.hasID(g.identifier.ID(next)), "no new registration must be created for a finishing source")
 }
 
+func TestHarvesterRunner_MigrateNotifiesOpenSession(t *testing.T) {
+	h := &fakeHarvester{readFn: blockUntilCancelled}
+	g := testHarvesterRunner(t, h, 0)
+
+	goroutines := resources.NewGoroutinesChecker()
+	defer goroutines.WaitUntilOriginalCount()
+
+	g.start()
+	oldSrc := &testSource{name: "/path/to/old"}
+	newSrc := &testSource{name: "/path/to/new"}
+	oldID := g.identifier.ID(oldSrc)
+
+	g.Start(startContext(t), oldSrc)
+	requireEventually(t, func() bool { return h.opens() == 1 && h.lastSession().readCount() == 1 },
+		"the session must be open and reading")
+
+	require.NoError(t, g.Migrate(oldID, newSrc, func(string) error { return nil }), "Migrate")
+	assert.Equal(t, []Source{newSrc}, h.lastSession().migrations(),
+		"the open session must receive its new source")
+
+	g.Stop(newSrc)
+	require.NoError(t, g.StopHarvesters())
+}
+
+func TestHarvesterRunner_MigrateWhileOpeningNotifiesSession(t *testing.T) {
+	opening := make(chan struct{})
+	release := make(chan struct{})
+	h := &fakeHarvester{readFn: blockUntilCancelled}
+	h.openFn = func(Source) {
+		close(opening)
+		<-release
+	}
+	g := testHarvesterRunner(t, h, 0)
+
+	goroutines := resources.NewGoroutinesChecker()
+	defer goroutines.WaitUntilOriginalCount()
+
+	g.start()
+	oldSrc := &testSource{name: "/path/to/old"}
+	newSrc := &testSource{name: "/path/to/new"}
+	oldID := g.identifier.ID(oldSrc)
+
+	g.Start(startContext(t), oldSrc)
+	select {
+	case <-opening:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the source was never opened")
+	}
+	require.NoError(t, g.Migrate(oldID, newSrc, func(string) error { return nil }), "Migrate")
+	close(release)
+
+	requireEventually(t, func() bool { return h.opens() == 1 && h.lastSession().readCount() == 1 },
+		"the session must finish opening and start reading")
+	s := h.lastSession()
+	assert.Same(t, oldSrc, s.openedAs, "the session must open before the migration")
+	assert.Equal(t, []Source{newSrc}, s.migrations(),
+		"the session must receive the migration that occurred while it opened")
+
+	g.Stop(newSrc)
+	require.NoError(t, g.StopHarvesters())
+}
+
+func TestHarvesterRunner_MigrateQueuedSourceOpensAsNext(t *testing.T) {
+	h := &fakeHarvester{readFn: blockUntilCancelled}
+	g := testHarvesterRunner(t, h, 1)
+
+	goroutines := resources.NewGoroutinesChecker()
+	defer goroutines.WaitUntilOriginalCount()
+
+	g.start()
+	blocker := &testSource{name: "/path/to/blocker"}
+	oldSrc := &testSource{name: "/path/to/old"}
+	newSrc := &testSource{name: "/path/to/new"}
+	oldID := g.identifier.ID(oldSrc)
+
+	g.Start(startContext(t), blocker)
+	requireEventually(t, func() bool { return h.opens() == 1 }, "the blocker must take the only slot")
+	g.Start(startContext(t), oldSrc)
+	requireEventually(t, func() bool {
+		st, ok := g.statusOf(oldID)
+		return ok && st == statusWaiting
+	}, "the second source must be queued")
+
+	require.NoError(t, g.Migrate(oldID, newSrc, func(string) error { return nil }), "Migrate")
+	g.Stop(blocker)
+
+	requireEventually(t, func() bool { return h.opens() == 2 }, "the queued source must open when the slot is free")
+	s := h.session(1)
+	assert.Same(t, newSrc, s.openedAs, "the migrated source must open with its new identity")
+	assert.Empty(t, s.migrations(), "an unopened source does not need a migration notification")
+
+	g.Stop(newSrc)
+	require.NoError(t, g.StopHarvesters())
+}
+
 // TestHarvesterRunner_StopUnknownSourceIsNoop asserts Stop on a source that is
 // not being harvested does nothing and does not panic.
 func TestHarvesterRunner_StopUnknownSourceIsNoop(t *testing.T) {
@@ -1456,20 +1552,25 @@ type fakeHarvester struct {
 	readFn   func(call int, ctx v2.Context) (SliceVerdict, error)
 	pollFn   func(call int) PollResult
 	sessions []*fakeSession
+
+	openFn func(src Source)
 }
 
 func (h *fakeHarvester) Name() string                          { return "fake" }
 func (h *fakeHarvester) Test(_ Source, _ v2.TestContext) error { return nil }
 
 func (h *fakeHarvester) OpenSession(
-	_ v2.Context, _ Source, _ string, _ Cursor, _ *Metrics,
+	_ v2.Context, src Source, _ string, _ Cursor, _ *Metrics,
 ) (HarvesterSession, error) {
+	if h.openFn != nil {
+		h.openFn(src)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.openErr != nil {
 		return nil, h.openErr
 	}
-	s := &fakeSession{readFn: h.readFn, pollFn: h.pollFn, gzip: h.gzip}
+	s := &fakeSession{readFn: h.readFn, pollFn: h.pollFn, gzip: h.gzip, openedAs: src}
 	h.sessions = append(h.sessions, s)
 	return s, nil
 }
@@ -1505,6 +1606,21 @@ type fakeSession struct {
 
 	readFn func(call int, ctx v2.Context) (SliceVerdict, error)
 	pollFn func(call int) PollResult
+
+	openedAs Source
+	migrated []Source
+}
+
+func (s *fakeSession) SourceMigrated(next Source) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.migrated = append(s.migrated, next)
+}
+
+func (s *fakeSession) migrations() []Source {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.migrated)
 }
 
 func (s *fakeSession) ReadSlice(ctx v2.Context, _ Publisher) (SliceVerdict, error) {

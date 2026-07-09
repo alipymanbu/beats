@@ -21,13 +21,23 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	loginp "github.com/elastic/beats/v7/filebeat/input/filestream/internal/input-logfile"
 	"github.com/elastic/beats/v7/libbeat/common/file"
 )
+
+func completeDesc(sum string) loginp.FileDescriptor {
+	return loginp.FileDescriptor{Fingerprint: completeFP(sum)}
+}
+
+func growingDesc(raw string) loginp.FileDescriptor {
+	return loginp.FileDescriptor{Fingerprint: loginp.FingerprintID{Raw: raw}}
+}
 
 // tempFileInfo returns the stat of a fresh temp file. Distinct calls yield
 // distinct OS identities on every platform.
@@ -53,12 +63,15 @@ func TestFileStateTable_RegisterPinLookup(t *testing.T) {
 	_, ok := tbl.LookupOSState("id-1")
 	assert.False(t, ok, "LookupOSState must fail before any Register")
 
-	h := tbl.Register("id-1")
+	h := tbl.Register("id-1", completeDesc("sum-1"))
 	assert.NotNil(t, h, "Register must return a handle")
 
 	// Registered but not pinned: no OS state yet.
 	_, ok = tbl.LookupOSState("id-1")
 	assert.False(t, ok, "LookupOSState must fail on an unpinned entry")
+
+	assert.Equal(t, "sum-1", h.FingerprintSum(),
+		"FingerprintSum must return the completed Sum passed to Register")
 
 	want := nonZeroOSState(t)
 	h.PinOSState(want)
@@ -69,7 +82,7 @@ func TestFileStateTable_RegisterPinLookup(t *testing.T) {
 
 func TestFileStateTable_LookupZeroStateOSReadsAsNoPin(t *testing.T) {
 	tbl := newFileStateTable()
-	h := tbl.Register("id-1")
+	h := tbl.Register("id-1", completeDesc("sum-1"))
 
 	// A zero StateOS (e.g. Windows loadFileId failing) must read as "no pin".
 	h.PinOSState(file.StateOS{})
@@ -77,10 +90,72 @@ func TestFileStateTable_LookupZeroStateOSReadsAsNoPin(t *testing.T) {
 	assert.False(t, ok, "a zero pinned StateOS must read as no pin")
 }
 
+func TestFileStateTable_FingerprintSum(t *testing.T) {
+	tbl := newFileStateTable()
+
+	complete := tbl.Register("complete", completeDesc("the-sum"))
+	assert.Equal(t, "the-sum", complete.FingerprintSum(),
+		"a completed fingerprint must expose its Sum")
+
+	growing := tbl.Register("growing", growingDesc("deadbeef"))
+	assert.Empty(t, growing.FingerprintSum(),
+		"an incomplete fingerprint must expose no Sum")
+}
+
+func TestFileStateTable_UpdateDescriptorUpdatesIfPresent(t *testing.T) {
+	tbl := newFileStateTable()
+
+	tbl.UpdateDescriptor("absent", completeDesc("sum"))
+	_, ok := tbl.LookupOSState("absent")
+	assert.False(t, ok, "UpdateDescriptor must not insert an entry for an absent key")
+
+	h := tbl.Register("id-1", growingDesc("deadbeef"))
+	assert.Empty(t, h.FingerprintSum(), "handle must start below threshold with no Sum")
+
+	tbl.UpdateDescriptor("id-1", completeDesc("final-sum"))
+	assert.Equal(t, "final-sum", h.FingerprintSum(),
+		"UpdateDescriptor must make the completed Sum visible on the handle")
+}
+
+func TestFileStateTable_RekeyPreservesHandle(t *testing.T) {
+	tbl := newFileStateTable()
+	h := tbl.Register("old-id", completeDesc("sum-1"))
+	pinned := nonZeroOSState(t)
+	h.PinOSState(pinned)
+
+	h.Rekey("new-id")
+
+	_, ok := tbl.LookupOSState("old-id")
+	assert.False(t, ok, "old key must no longer resolve after Rekey")
+
+	got, ok := tbl.LookupOSState("new-id")
+	assert.True(t, ok, "new key must resolve to the migrated handle after Rekey")
+	assert.Equal(t, pinned, got, "Rekey must preserve the pinned StateOS")
+	assert.Equal(t, "sum-1", h.FingerprintSum(), "Rekey must preserve the handle's descriptor")
+
+	tbl.UpdateDescriptor("new-id", completeDesc("sum-2"))
+	assert.Equal(t, "sum-2", h.FingerprintSum(),
+		"UpdateDescriptor under the new key must reach the migrated handle")
+	tbl.UpdateDescriptor("old-id", completeDesc("ignored"))
+	assert.Equal(t, "sum-2", h.FingerprintSum(),
+		"UpdateDescriptor under the stale old key must not reach the handle")
+}
+
+func TestFileStateTable_RekeyDeregisteredIsNoOp(t *testing.T) {
+	tbl := newFileStateTable()
+	h := tbl.Register("old-id", completeDesc("sum"))
+	h.PinOSState(nonZeroOSState(t))
+	tbl.Deregister(h)
+
+	h.Rekey("new-id")
+	_, ok := tbl.LookupOSState("new-id")
+	assert.False(t, ok, "Rekey of a deregistered handle must not create an entry")
+}
+
 func TestFileStateTable_DeregisterCompareAndDelete(t *testing.T) {
 	t.Run("removes its own entry", func(t *testing.T) {
 		tbl := newFileStateTable()
-		h := tbl.Register("id-1")
+		h := tbl.Register("id-1", completeDesc("sum"))
 		h.PinOSState(nonZeroOSState(t))
 
 		tbl.Deregister(h)
@@ -92,8 +167,8 @@ func TestFileStateTable_DeregisterCompareAndDelete(t *testing.T) {
 		tbl := newFileStateTable()
 
 		// During a restart, the new harvester can register before the old one closes.
-		old := tbl.Register("id-1")
-		newer := tbl.Register("id-1")
+		old := tbl.Register("id-1", completeDesc("old"))
+		newer := tbl.Register("id-1", completeDesc("new"))
 		newerPin := nonZeroOSState(t)
 		newer.PinOSState(newerPin)
 
@@ -108,6 +183,17 @@ func TestFileStateTable_DeregisterCompareAndDelete(t *testing.T) {
 		_, ok = tbl.LookupOSState("id-1")
 		assert.False(t, ok, "the newer handle must be able to deregister itself")
 	})
+
+	t.Run("Deregister after Rekey removes at the current key", func(t *testing.T) {
+		tbl := newFileStateTable()
+		h := tbl.Register("old-id", completeDesc("sum"))
+		h.PinOSState(nonZeroOSState(t))
+		h.Rekey("new-id")
+
+		tbl.Deregister(h)
+		_, ok := tbl.LookupOSState("new-id")
+		assert.False(t, ok, "Deregister must remove the handle at its post-Rekey key")
+	})
 }
 
 func TestFileStateTable_NilSafety(t *testing.T) {
@@ -115,16 +201,20 @@ func TestFileStateTable_NilSafety(t *testing.T) {
 	var h *openFileState
 
 	// None of these must panic on a nil table / nil handle.
-	assert.Nil(t, tbl.Register("id"),
+	assert.Nil(t, tbl.Register("id", completeDesc("sum")),
 		"Register on a nil table must return nil")
+	tbl.UpdateDescriptor("id", completeDesc("sum"))
+	h.Rekey("b")
 	tbl.Deregister(h)
 	_, ok := tbl.LookupOSState("id")
 	assert.False(t, ok, "LookupOSState on a nil table must report no pin")
 
 	h.PinOSState(nonZeroOSState(t))
+	assert.Empty(t, h.FingerprintSum(), "FingerprintSum on a nil handle must be empty")
+
 	// A handle obtained from a real table must tolerate a nil-table Deregister path too.
 	realTable := newFileStateTable()
-	realHandle := realTable.Register("id")
+	realHandle := realTable.Register("id", completeDesc("sum"))
 	tbl.Deregister(realHandle) // nil table, real handle: still a no-op, no panic
 }
 
@@ -139,19 +229,30 @@ func TestFileStateTable_ConcurrentAccess(t *testing.T) {
 
 	for i := range workers {
 		key := "id-" + strconv.Itoa(i)
-		// Harvester goroutine: Register, Pin, Deregister.
+		var current atomic.Pointer[openFileState]
+
 		wg.Go(func() {
 			for range ops {
-				h := tbl.Register(key)
+				h := tbl.Register(key, growingDesc("dead"))
+				current.Store(h)
 				h.PinOSState(pinned)
+				_ = h.FingerprintSum()
 				tbl.Deregister(h)
 			}
 		})
 
-		// Scanner goroutine: LookupOSState.
 		wg.Go(func() {
 			for range ops {
+				tbl.UpdateDescriptor(key, completeDesc("sum"))
 				_, _ = tbl.LookupOSState(key)
+			}
+		})
+
+		wg.Go(func() {
+			for range ops {
+				h := current.Load()
+				h.Rekey(key + "-moved")
+				h.Rekey(key)
 			}
 		})
 	}

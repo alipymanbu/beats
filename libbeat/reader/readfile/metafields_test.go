@@ -24,11 +24,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/elastic/beats/v7/libbeat/reader"
 	"github.com/elastic/elastic-agent-libs/mapstr"
 )
+
+// constFingerprint returns a fingerprintFn that always resolves to s.
+func constFingerprint(s string) func() string {
+	return func() string { return s }
+}
+
+// fingerprintFnFor returns a constant callback, or nil for an empty value.
+func fingerprintFnFor(s string) func() string {
+	if s == "" {
+		return nil
+	}
+	return constFingerprint(s)
+}
 
 func TestMetaFields(t *testing.T) {
 	messages := []reader.Message{
@@ -52,7 +66,7 @@ func TestMetaFields(t *testing.T) {
 	path := "test/path"
 	offset := int64(0)
 
-	in := &FileMetaReader{reader: msgReader(messages), path: path, fi: createTestFileInfo(), fingerprint: "hash", offset: offset}
+	in := &FileMetaReader{reader: msgReader(messages), path: path, fi: createTestFileInfo(), fingerprintFn: constFingerprint("hash"), offset: offset}
 	for {
 		msg, err := in.Next()
 		if errors.Is(err, io.EOF) {
@@ -97,7 +111,7 @@ func TestMetaFieldsOwnerAndGroup(t *testing.T) {
 	path := "test/path"
 	offset := int64(0)
 
-	in := &FileMetaReader{reader: msgReader(messages), path: path, fi: createTestFileInfo(), includeOwner: true, includeGroup: true, fingerprint: "hash", offset: offset}
+	in := &FileMetaReader{reader: msgReader(messages), path: path, fi: createTestFileInfo(), includeOwner: true, includeGroup: true, fingerprintFn: constFingerprint("hash"), offset: offset}
 	for {
 		msg, err := in.Next()
 		if errors.Is(err, io.EOF) {
@@ -119,6 +133,65 @@ func TestMetaFieldsOwnerAndGroup(t *testing.T) {
 
 		require.Equal(t, offset, in.offset)
 	}
+}
+
+// TestMetaFieldsLazyFingerprint covers a fingerprint that becomes available
+// while the file is open. Later events must include the completed SHA-256.
+func TestMetaFieldsLazyFingerprint(t *testing.T) {
+	newMessages := func() []reader.Message {
+		return []reader.Message{
+			{Content: []byte("line one"), Bytes: 8, Fields: mapstr.M{}},
+			{Content: []byte("line two"), Bytes: 8, Fields: mapstr.M{}},
+			{Content: []byte("line three"), Bytes: 10, Fields: mapstr.M{}},
+		}
+	}
+
+	fingerprintOf := func(msg reader.Message) (string, bool) {
+		v, err := msg.Fields.GetValue("log.file.fingerprint")
+		if err != nil {
+			return "", false
+		}
+		s, _ := v.(string)
+		return s, true
+	}
+
+	t.Run("nil fingerprintFn never emits the field", func(t *testing.T) {
+		in := &FileMetaReader{reader: msgReader(newMessages()), path: "p", fi: createTestFileInfo()}
+		for {
+			msg, err := in.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			_, ok := fingerprintOf(msg)
+			assert.False(t, ok, "no fingerprint must be emitted when fingerprintFn is nil")
+		}
+	})
+
+	t.Run("empty-to-sum transition emits from the crossing onward", func(t *testing.T) {
+		// Return "" until the third line, then a completed SHA-256.
+		results := []string{"", "", "the-sum", ""}
+		fn := func() string {
+			r := results[0]
+			results = results[1:]
+			return r
+		}
+		messages := append(newMessages(), reader.Message{Content: []byte("line four"), Bytes: 9, Fields: mapstr.M{}})
+		in := &FileMetaReader{reader: msgReader(messages), path: "p", fi: createTestFileInfo(), fingerprintFn: fn}
+
+		var got []string
+		for {
+			msg, err := in.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			require.NoError(t, err, "Next must not fail")
+			fp, _ := fingerprintOf(msg)
+			got = append(got, fp)
+		}
+		assert.Equal(t, []string{"", "", "the-sum", "the-sum"}, got,
+			"log.file.fingerprint of each event")
+		assert.Len(t, results, 1, "the callback must stop after returning the completed fingerprint")
+	})
 }
 
 func msgReader(m []reader.Message) reader.Reader {
@@ -196,10 +269,10 @@ func BenchmarkFileMetaReaderNext(b *testing.B) {
 
 	b.Run("with-fingerprint", func(b *testing.B) {
 		r := &FileMetaReader{
-			reader:      &freshMsgReader{msg: base},
-			path:        "/var/log/app/test.log",
-			fi:          fi,
-			fingerprint: "abc123deadbeef0123456789abcdef01",
+			reader:        &freshMsgReader{msg: base},
+			path:          "/var/log/app/test.log",
+			fi:            fi,
+			fingerprintFn: constFingerprint("abc123deadbeef0123456789abcdef01"),
 		}
 		b.ReportAllocs()
 		b.ResetTimer()

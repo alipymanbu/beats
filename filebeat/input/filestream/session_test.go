@@ -295,6 +295,20 @@ func TestHarvestSession_Close(t *testing.T) {
 	})
 }
 
+func TestHarvestSession_SourceMigrated(t *testing.T) {
+	tbl := newFileStateTable()
+	h := tbl.Register("fingerprint::old", completeDesc("sum"))
+	s := &harvestSession{inp: &filestream{harvesterState: tbl}, harvesterState: h}
+
+	s.SourceMigrated(fileSource{fileID: "fingerprint::new"})
+
+	assert.Same(t, h, tbl.entries["fingerprint::new"], "the session entry must move to the new identity")
+	_, ok := tbl.entries["fingerprint::old"]
+	assert.False(t, ok, "the old identity must no longer resolve")
+
+	(&harvestSession{inp: &filestream{}}).SourceMigrated(fileSource{fileID: "fingerprint::other"})
+}
+
 // --- OpenSession & Test -------------------------------------------------
 
 func TestFilestream_OpenSession_NotFileSource(t *testing.T) {

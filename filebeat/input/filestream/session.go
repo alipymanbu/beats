@@ -118,7 +118,7 @@ func (inp *filestream) OpenSession(
 		return nil, err
 	}
 
-	s.harvesterState = inp.harvesterState.Register(src.Name())
+	s.harvesterState = inp.harvesterState.Register(src.Name(), fs.desc)
 	// If fstat fails, the entry has no usable open file identity.
 	if fi, err := f.Stat(); err == nil {
 		s.harvesterState.PinOSState(file.GetOSState(fi))
@@ -169,7 +169,7 @@ func (s *harvestSession) ReadSlice(
 		return loginp.SliceDone,
 			fmt.Errorf("cannot seek '%s' to offset %d: %w", s.src.newPath, s.state.Offset, err)
 	}
-	r, logReader, err := s.inp.buildPipeline(s.log, ctx.Cancelation, s.file, s.enc, s.src, s.state.Offset)
+	r, logReader, err := s.inp.buildPipeline(s.log, ctx.Cancelation, s.file, s.enc, s.src, s.state.Offset, s.harvesterState)
 	if err != nil {
 		return loginp.SliceDone,
 			fmt.Errorf("cannot build reader pipeline for '%s': %w", s.src.newPath, err)
@@ -351,6 +351,12 @@ func (s *harvestSession) Poll() loginp.PollResult {
 	}
 
 	return loginp.PollPark
+}
+
+var _ loginp.SourceMigrator = (*harvestSession)(nil)
+
+func (s *harvestSession) SourceMigrated(next loginp.Source) {
+	s.harvesterState.Rekey(next.Name())
 }
 
 // Offset returns the current read offset.

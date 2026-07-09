@@ -94,6 +94,11 @@ type HarvesterSession interface {
 	Close() error
 }
 
+// SourceMigrator lets a session follow changes to its source identity.
+type SourceMigrator interface {
+	SourceMigrated(next Source)
+}
+
 // HarvesterGroup is responsible for running the Harvesters started by the
 // Prospector.
 type HarvesterGroup interface {
@@ -114,7 +119,8 @@ type HarvesterGroup interface {
 	// running under its new identity without being restarted. It is safe to call
 	// when nothing is registered under oldID, in which case only updateStore
 	// runs. It returns an error if a harvester is already registered under next's
-	// identity.
+	// identity. An open session implementing SourceMigrator is told the new
+	// source.
 	Migrate(oldID string, next Source, updateStore func(newID string) error) error
 }
 
