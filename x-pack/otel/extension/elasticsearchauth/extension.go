@@ -6,13 +6,10 @@ package elasticsearchauth
 
 import (
 	"context"
-	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
-
-	"golang.org/x/net/http2"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension"
@@ -20,10 +17,9 @@ import (
 )
 
 var (
-	_ extension.Extension                 = (*authenticator)(nil)
-	_ extensionauth.HTTPClient            = (*authenticator)(nil)
-	_ EndpointsProvider                   = (*authenticator)(nil)
-	_ interface{ CloseIdleConnections() } = (*authenticatedRoundTripper)(nil)
+	_ extension.Extension      = (*authenticator)(nil)
+	_ extensionauth.HTTPClient = (*authenticator)(nil)
+	_ EndpointsProvider        = (*authenticator)(nil)
 )
 
 // EndpointsProvider provides configured Elasticsearch endpoints.
@@ -31,20 +27,37 @@ type EndpointsProvider interface {
 	Endpoints() []string
 }
 
-// authenticator owns TLS and proxy settings. RoundTripper constructs a fresh,
-// consumer-owned transport from those settings and does not inherit them from
-// the supplied base transport.
+// authenticator applies Elasticsearch destination credentials and headers over
+// the base transport supplied by the consumer to RoundTripper, optionally after
+// that transport has been processed by a nested HTTP client authenticator.
 type authenticator struct {
-	config    *Config
-	tlsConfig *tls.Config
+	id         component.ID
+	config     *Config
+	nestedAuth extensionauth.HTTPClient
 }
 
-func newAuthenticator(config *Config, tlsConfig *tls.Config) *authenticator {
-	return &authenticator{config: config, tlsConfig: tlsConfig}
+func newAuthenticator(id component.ID, config *Config) *authenticator {
+	return &authenticator{id: id, config: config}
 }
 
-// Start is no-op
-func (*authenticator) Start(context.Context, component.Host) error {
+// Start resolves the optional nested authenticator without constructing its
+// transport.
+func (a *authenticator) Start(ctx context.Context, host component.Host) error {
+	a.nestedAuth = nil
+	if !a.config.Auth.HasValue() {
+		return nil
+	}
+
+	authConfig := a.config.Auth.Get()
+	if authConfig.AuthenticatorID == a.id {
+		return fmt.Errorf("nested authenticator %q cannot reference itself", authConfig.AuthenticatorID)
+	}
+
+	nestedAuth, err := authConfig.GetHTTPClientAuthenticator(ctx, host.GetExtensions())
+	if err != nil {
+		return err
+	}
+	a.nestedAuth = nestedAuth
 	return nil
 }
 
@@ -59,68 +72,32 @@ func (a *authenticator) Endpoints() []string {
 	return slices.Clone(a.config.Endpoints)
 }
 
-// RoundTripper creates a new configured and authenticated transport. The base
-// transport is intentionally ignored: this extension is authoritative for TLS
-// and proxy settings.
-func (a *authenticator) RoundTripper(_ http.RoundTripper) (http.RoundTripper, error) {
-	transport, err := a.newTransport()
-	if err != nil {
-		return nil, err
+// RoundTripper optionally delegates transport construction to the nested
+// authenticator, then applies Elasticsearch destination headers and credentials.
+// If base is nil, http.DefaultTransport is used.
+func (a *authenticator) RoundTripper(base http.RoundTripper) (http.RoundTripper, error) {
+	if base == nil {
+		base = http.DefaultTransport
 	}
-	return &authenticatedRoundTripper{transport: transport, config: a.config}, nil
-}
-
-func (a *authenticator) newTransport() (*http.Transport, error) {
-	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, fmt.Errorf("default HTTP transport has unexpected type %T", http.DefaultTransport)
-	}
-	transport := defaultTransport.Clone()
-	if a.tlsConfig != nil {
-		transport.TLSClientConfig = a.tlsConfig.Clone()
-	}
-	if a.config.ClientConfig.ReadBufferSize > 0 {
-		transport.ReadBufferSize = a.config.ClientConfig.ReadBufferSize
-	}
-	if a.config.ClientConfig.WriteBufferSize > 0 {
-		transport.WriteBufferSize = a.config.ClientConfig.WriteBufferSize
+	transport := base
+	if a.config.Auth.HasValue() {
+		if a.nestedAuth == nil {
+			return nil, errors.New("nested authenticator has not been resolved; start elasticsearchauth before constructing its transport")
+		}
+		var err error
+		transport, err = a.nestedAuth.RoundTripper(base)
+		if err != nil {
+			return nil, err
+		}
+		if transport == nil {
+			return nil, errors.New("nested authenticator returned a nil transport")
+		}
 	}
 
-	// Keepalive remains populated only in programmatic configurations and takes precedence, matching confighttp.ToClient.
-	if keepalive := a.config.ClientConfig.Keepalive.Get(); keepalive != nil {
-		transport.DisableKeepAlives = false
-		transport.MaxIdleConns = keepalive.MaxIdleConns
-		transport.MaxIdleConnsPerHost = keepalive.MaxIdleConnsPerHost
-		transport.IdleConnTimeout = keepalive.IdleConnTimeout
-	} else {
-		//nolint:staticcheck // confighttp.ClientConfig documents these as its effective decoded values.
-		transport.DisableKeepAlives = a.config.ClientConfig.DisableKeepAlives
-		//nolint:staticcheck // confighttp.ClientConfig documents these as its effective decoded values.
-		transport.MaxIdleConns = a.config.ClientConfig.MaxIdleConns
-		//nolint:staticcheck // confighttp.ClientConfig documents these as its effective decoded values.
-		transport.MaxIdleConnsPerHost = a.config.ClientConfig.MaxIdleConnsPerHost
-		//nolint:staticcheck // confighttp.ClientConfig documents these as its effective decoded values.
-		transport.IdleConnTimeout = a.config.ClientConfig.IdleConnTimeout
-	}
-	transport.MaxConnsPerHost = a.config.ClientConfig.MaxConnsPerHost
-	transport.ForceAttemptHTTP2 = a.config.ClientConfig.ForceAttemptHTTP2
-	if a.config.ClientConfig.ProxyURL != "" {
-		proxyURL, err := url.ParseRequestURI(a.config.ClientConfig.ProxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid proxy_url: %w", err)
-		}
-		transport.Proxy = http.ProxyURL(proxyURL)
-	}
-	if a.config.ClientConfig.HTTP2ReadIdleTimeout > 0 {
-		// ConfigureTransports attaches the returned HTTP/2 transport to transport.
-		http2transport, err := http2.ConfigureTransports(transport)
-		if err != nil {
-			return nil, fmt.Errorf("configure HTTP/2 transport: %w", err)
-		}
-		http2transport.ReadIdleTimeout = a.config.ClientConfig.HTTP2ReadIdleTimeout
-		http2transport.PingTimeout = a.config.ClientConfig.HTTP2PingTimeout
-	}
-	return transport, nil
+	return &authenticatedRoundTripper{
+		transport: transport,
+		config:    a.config,
+	}, nil
 }
 
 type authenticatedRoundTripper struct {
@@ -133,10 +110,10 @@ func (a *authenticatedRoundTripper) RoundTrip(request *http.Request) (*http.Resp
 	if clonedRequest.Header == nil {
 		clonedRequest.Header = make(http.Header)
 	}
-	if host, found := a.config.ClientConfig.Headers.Get("Host"); found && host != "" {
+	if host, found := a.config.Headers.Get("Host"); found && host != "" {
 		clonedRequest.Host = string(host)
 	}
-	for name, value := range a.config.ClientConfig.Headers.Iter {
+	for name, value := range a.config.Headers.Iter {
 		clonedRequest.Header.Set(name, string(value))
 	}
 	if a.config.APIKey != "" {
@@ -145,12 +122,4 @@ func (a *authenticatedRoundTripper) RoundTrip(request *http.Request) (*http.Resp
 		clonedRequest.SetBasicAuth(a.config.User, string(a.config.Password))
 	}
 	return a.transport.RoundTrip(clonedRequest)
-}
-
-// CloseIdleConnections forwards connection-pool cleanup to the consumer-owned
-// transport when it supports the standard HTTP close operation.
-func (a *authenticatedRoundTripper) CloseIdleConnections() {
-	if closer, ok := a.transport.(interface{ CloseIdleConnections() }); ok {
-		closer.CloseIdleConnections()
-	}
 }

@@ -13,21 +13,22 @@ import (
 	"strings"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configauth"
 	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/config/configoptional"
 )
 
 // Config configures the Elasticsearch authentication extension.
-//
-// The embedded HTTP configuration supplies the TLS, proxy, header, pool, and
-// keepalive settings used by transports returned from RoundTripper. Its
-// endpoint, timeout, auth, middleware, cookie, and compression settings are
-// intentionally unsupported by this extension.
 type Config struct {
-	ClientConfig confighttp.ClientConfig `mapstructure:",squash"`
+	// Auth optionally identifies an HTTP client authenticator that owns the
+	// underlying transport and all transport-level configuration.
+	Auth configoptional.Optional[configauth.Config] `mapstructure:"auth,omitempty"`
 
 	// Endpoints contains the resolved Elasticsearch HTTP(S) endpoints.
 	Endpoints []string `mapstructure:"endpoints"`
+
+	// Headers contains destination headers applied to Elasticsearch requests.
+	Headers configopaque.MapList `mapstructure:"headers,omitempty"`
 
 	// User configures HTTP Basic authentication with Password.
 	User string `mapstructure:"user"`
@@ -39,31 +40,19 @@ type Config struct {
 }
 
 func createDefaultConfig() component.Config {
-	return &Config{ClientConfig: confighttp.NewDefaultClientConfig()}
+	return &Config{Auth: configoptional.None[configauth.Config]()}
 }
 
-// Validate validates configuration relationships without accessing TLS files.
+// Validate validates Elasticsearch destination configuration.
 func (c *Config) Validate() error {
 	if len(c.Endpoints) == 0 {
 		return errors.New("at least one endpoint must be configured")
 	}
-	if c.ClientConfig.Endpoint != "" {
-		return unsupportedFieldError("endpoint")
-	}
-	if c.ClientConfig.Timeout != 0 {
-		return unsupportedFieldError("timeout")
-	}
-	if c.ClientConfig.Auth.HasValue() {
-		return unsupportedFieldError("auth")
-	}
-	if len(c.ClientConfig.Middlewares) != 0 {
-		return unsupportedFieldError("middlewares")
-	}
-	if c.ClientConfig.Cookies.HasValue() {
-		return unsupportedFieldError("cookies")
-	}
-	if c.ClientConfig.Compression.IsCompressed() {
-		return unsupportedFieldError("compression")
+
+	hasExplicitCredentials := c.User != "" || c.Password != "" || c.APIKey != ""
+	hasAuthorizationHeader := hasHeader(c.Headers, "Authorization")
+	if hasExplicitCredentials && hasAuthorizationHeader {
+		return errors.New("authorization header cannot be combined with user, password, or api_key")
 	}
 
 	for _, endpoint := range c.Endpoints {
@@ -71,14 +60,8 @@ func (c *Config) Validate() error {
 		if err != nil {
 			return fmt.Errorf("invalid endpoint: %w", err)
 		}
-		if u.User != nil && (c.User != "" || c.Password != "" || c.APIKey != "") {
+		if u.User != nil && (hasExplicitCredentials || hasAuthorizationHeader) {
 			return errors.New("endpoint userinfo cannot be combined with configured authentication")
-		}
-	}
-
-	if c.ClientConfig.ProxyURL != "" {
-		if _, err := parseHTTPURL(c.ClientConfig.ProxyURL); err != nil {
-			return fmt.Errorf("invalid proxy_url: %w", err)
 		}
 	}
 
@@ -89,21 +72,13 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func unsupportedFieldError(field string) error {
-	switch field {
-	case "endpoint":
-		return errors.New("endpoint is unsupported; configure endpoints instead")
-	case "timeout":
-		return errors.New("timeout is unsupported; consumers own request deadlines")
-	case "auth":
-		return errors.New("nested auth is unsupported")
-	case "compression_params":
-		return errors.New("compression_params are unsupported")
-	case "compression":
-		return errors.New("compression is unsupported")
-	default:
-		return fmt.Errorf("%s are unsupported", field)
+func hasHeader(headers configopaque.MapList, name string) bool {
+	for header := range headers.Iter {
+		if strings.EqualFold(header, name) {
+			return true
+		}
 	}
+	return false
 }
 
 func parseHTTPURL(rawURL string) (*url.URL, error) {

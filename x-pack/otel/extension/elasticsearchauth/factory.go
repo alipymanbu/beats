@@ -24,7 +24,7 @@ func NewFactory() extension.Factory {
 	return extension.NewFactory(Type, createDefaultConfig, createExtension, ExtensionStability)
 }
 
-func createExtension(ctx context.Context, _ extension.Settings, cfg component.Config) (extension.Extension, error) {
+func createExtension(_ context.Context, settings extension.Settings, cfg component.Config) (extension.Extension, error) {
 	config, ok := cfg.(*Config)
 	if !ok {
 		return nil, fmt.Errorf("invalid elasticsearchauth configuration type %T", cfg)
@@ -32,9 +32,5 @@ func createExtension(ctx context.Context, _ extension.Settings, cfg component.Co
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	tlsConfig, err := config.ClientConfig.TLS.LoadTLSConfig(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("invalid Elasticsearch TLS configuration: %w", err)
-	}
-	return newAuthenticator(config, tlsConfig), nil
+	return newAuthenticator(settings.ID, config), nil
 }

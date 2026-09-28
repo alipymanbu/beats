@@ -5,30 +5,22 @@
 package elasticsearchauth
 
 import (
-	"crypto/tls"
-	"crypto/x509"
+	"context"
 	"encoding/base64"
-	"encoding/pem"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configauth"
-	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/extension"
 	"gopkg.in/yaml.v3"
-
-	"github.com/elastic/elastic-agent-libs/transport/tlscommontest"
 )
 
 func TestConfigValidate(t *testing.T) {
@@ -39,10 +31,13 @@ func TestConfigValidate(t *testing.T) {
 		errText string
 	}{
 		{
-			name: "valid endpoints and API key",
+			name:   "valid unauthenticated destination",
+			config: validConfig,
+		},
+		{
+			name: "valid API key",
 			config: func() *Config {
 				config := validConfig()
-				config.Endpoints = []string{"https://es.example:9200/path?pretty=true"}
 				config.APIKey = validAPIKey
 				return config
 			},
@@ -53,6 +48,14 @@ func TestConfigValidate(t *testing.T) {
 				config := validConfig()
 				config.User = "elastic"
 				config.Password = "password"
+				return config
+			},
+		},
+		{
+			name: "valid authorization destination header",
+			config: func() *Config {
+				config := validConfig()
+				config.Headers = configopaque.MapList{{Name: "Authorization", Value: "Bearer token"}}
 				return config
 			},
 		},
@@ -93,19 +96,10 @@ func TestConfigValidate(t *testing.T) {
 			errText: "fragments",
 		},
 		{
-			name: "invalid API key base64",
+			name: "invalid API key",
 			config: func() *Config {
 				config := validConfig()
 				config.APIKey = "not-base64"
-				return config
-			},
-			errText: "base64-encoded id:key",
-		},
-		{
-			name: "API key without id and key",
-			config: func() *Config {
-				config := validConfig()
-				config.APIKey = configopaque.String(base64.StdEncoding.EncodeToString([]byte("id")))
 				return config
 			},
 			errText: "base64-encoded id:key",
@@ -129,7 +123,7 @@ func TestConfigValidate(t *testing.T) {
 			errText: "configured together",
 		},
 		{
-			name: "API key and basic auth conflict",
+			name: "API key and basic authentication conflict",
 			config: func() *Config {
 				config := validConfig()
 				config.User = "elastic"
@@ -140,7 +134,17 @@ func TestConfigValidate(t *testing.T) {
 			errText: "cannot be combined",
 		},
 		{
-			name: "endpoint userinfo and explicit credentials conflict",
+			name: "authorization header and API key conflict",
+			config: func() *Config {
+				config := validConfig()
+				config.APIKey = validAPIKey
+				config.Headers = configopaque.MapList{{Name: "authorization", Value: "Bearer token"}}
+				return config
+			},
+			errText: "authorization header cannot be combined",
+		},
+		{
+			name: "endpoint userinfo and basic authentication conflict",
 			config: func() *Config {
 				config := validConfig()
 				config.Endpoints = []string{"https://url-user:url-password@es.example:9200"}
@@ -151,40 +155,14 @@ func TestConfigValidate(t *testing.T) {
 			errText: "userinfo cannot be combined",
 		},
 		{
-			name: "nested auth is rejected",
+			name: "endpoint userinfo and authorization header conflict",
 			config: func() *Config {
 				config := validConfig()
-				config.ClientConfig.Auth = configoptional.Some(configauth.Config{})
+				config.Endpoints = []string{"https://url-user:url-password@es.example:9200"}
+				config.Headers = configopaque.MapList{{Name: "Authorization", Value: "Bearer token"}}
 				return config
 			},
-			errText: "nested auth",
-		},
-		{
-			name: "singular endpoint is rejected",
-			config: func() *Config {
-				config := validConfig()
-				config.ClientConfig.Endpoint = "https://es.example:9200"
-				return config
-			},
-			errText: "endpoint is unsupported",
-		},
-		{
-			name: "timeout is rejected",
-			config: func() *Config {
-				config := validConfig()
-				config.ClientConfig.Timeout = time.Second
-				return config
-			},
-			errText: "timeout is unsupported",
-		},
-		{
-			name: "invalid proxy URL",
-			config: func() *Config {
-				config := validConfig()
-				config.ClientConfig.ProxyURL = "tcp://proxy.example:8080"
-				return config
-			},
-			errText: "invalid proxy_url",
+			errText: "userinfo cannot be combined",
 		},
 	}
 
@@ -192,102 +170,82 @@ func TestConfigValidate(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			err := test.config().Validate()
 			if test.errText == "" {
-				require.NoError(t, err, "valid configuration must validate")
+				require.NoError(t, err, "valid configuration must pass validation")
 				return
 			}
-			require.ErrorContains(t, err, test.errText, "configuration must reject invalid structural input")
+			require.ErrorContains(t, err, test.errText, "invalid configuration must fail validation")
 		})
 	}
 }
 
 func TestConfigYAMLDecode(t *testing.T) {
-	tests := []struct {
-		name            string
-		yaml            string
-		expectEndpoints []string
-		expectUser      string
-		expectPassword  configopaque.String
-		expectProxyURL  string
-		expectHeader    configopaque.String
-		expectIdle      time.Duration
-	}{
-		{
-			name: "supported fields decode alongside endpoints and credentials",
-			yaml: `
+	raw := decodeYAML(t, `
+auth:
+  authenticator: beatsauth/default
+endpoints: [https://es.example:9200]
+headers:
+  Host: destination.example
+  X-Extension: extension
+user: elastic
+password: password
+`)
+	config := createDefaultConfig().(*Config)
+	require.NoError(t, confmap.NewFromStringMap(raw).Unmarshal(config), "supported configuration must decode")
+	require.NoError(t, config.Validate(), "decoded configuration must validate")
+	require.True(t, config.Auth.HasValue(), "optional delegated auth must decode when configured")
+	require.Equal(t, component.MustNewIDWithName("beatsauth", "default"), config.Auth.Get().AuthenticatorID, "authenticator component ID must decode")
+	require.Equal(t, []string{"https://es.example:9200"}, config.Endpoints, "endpoints must decode")
+	require.Equal(t, "elastic", config.User, "basic authentication user must decode")
+	require.Equal(t, configopaque.String("password"), config.Password, "basic authentication password must decode")
+	host, found := config.Headers.Get("Host")
+	require.True(t, found, "destination Host header must decode")
+	require.Equal(t, configopaque.String("destination.example"), host, "destination Host header value must decode")
+}
+
+func TestConfigYAMLDecodeWithoutAuth(t *testing.T) {
+	raw := decodeYAML(t, `
 endpoints: [https://es.example:9200]
 user: elastic
 password: password
-proxy_url: https://proxy.example:8443
 headers:
-  X-Test: value
-keepalive:
-  idle_conn_timeout: 5s
-`,
-			expectEndpoints: []string{"https://es.example:9200"},
-			expectUser:      "elastic",
-			expectPassword:  "password",
-			expectProxyURL:  "https://proxy.example:8443",
-			expectHeader:    "value",
-			expectIdle:      5 * time.Second,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var raw map[string]any
-			require.NoError(t, yaml.Unmarshal([]byte(test.yaml), &raw), "YAML fixture must decode")
-
-			defaultConfig := createDefaultConfig()
-			config, ok := defaultConfig.(*Config)
-			require.True(t, ok, "default configuration must be Config")
-
-			require.NoError(t, confmap.NewFromStringMap(raw).Unmarshal(config), "Collector confmap must decode extension configuration")
-
-			expectedEndpoints := test.expectEndpoints
-			if expectedEndpoints == nil {
-				expectedEndpoints = []string{"https://es.example:9200"}
-			}
-			require.Equal(t, expectedEndpoints, config.Endpoints, "endpoints must not be swallowed by HTTP config decoding")
-			require.Equal(t, test.expectUser, config.User, "user must decode with transport settings")
-			require.Equal(t, test.expectPassword, config.Password, "password must decode with transport settings")
-			require.Equal(t, test.expectProxyURL, config.ClientConfig.ProxyURL, "proxy_url must decode with extension fields")
-
-			header, found := config.ClientConfig.Headers.Get("X-Test")
-			require.True(t, found, "configured header must decode")
-			require.Equal(t, test.expectHeader, header, "configured header value must decode")
-
-			if test.expectIdle != 0 {
-				//nolint:staticcheck // confighttp folds decoded keepalive values into this field.
-				require.Equal(t, test.expectIdle, config.ClientConfig.IdleConnTimeout, "keepalive settings must decode")
-			}
-
-			require.NoError(t, config.Validate(), "supported decoded configuration must validate")
-		})
-	}
+  X-Extension: extension
+`)
+	config := createDefaultConfig().(*Config)
+	require.NoError(t, confmap.NewFromStringMap(raw).Unmarshal(config), "simple configuration must decode")
+	require.NoError(t, config.Validate(), "simple configuration must validate without auth")
+	require.False(t, config.Auth.HasValue(), "auth must remain optional when omitted")
 }
 
-func TestProgrammaticKeepaliveOverridesFlattenedFields(t *testing.T) {
+func TestNestedAuthenticatorTransportComposition(t *testing.T) {
+	base := &recordingRoundTripper{}
+	nestedTransport := &nestedRoundTripper{}
+	nestedAuth := &testHTTPClientAuthenticator{
+		wrap: func(base http.RoundTripper) http.RoundTripper {
+			nestedTransport.base = base
+			return nestedTransport
+		},
+	}
 	config := validConfig()
-	//nolint:staticcheck // confighttp.ClientConfig documents these as its effective decoded values.
-	config.ClientConfig.DisableKeepAlives = true
-	//nolint:staticcheck // confighttp.ClientConfig documents these as its effective decoded values.
-	config.ClientConfig.MaxIdleConns = 1
-	//nolint:staticcheck // confighttp.ClientConfig documents these as its effective decoded values.
-	config.ClientConfig.MaxIdleConnsPerHost = 2
-	//nolint:staticcheck // confighttp.ClientConfig documents these as its effective decoded values.
-	config.ClientConfig.IdleConnTimeout = time.Second
-	config.ClientConfig.Keepalive = configoptional.Some(confighttp.KeepaliveClientConfig{
-		MaxIdleConns:        10,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     30 * time.Second,
-	})
+	config.Auth = configoptional.Some(configauth.Config{AuthenticatorID: nestedAuthenticatorID()})
+	config.Headers = configopaque.MapList{{Name: "X-Extension", Value: "extension"}}
+	authenticator := createTestExtension(t, config)
 
-	transport, err := newAuthenticator(config, nil).newTransport()
-	require.NoError(t, err)
-	require.False(t, transport.DisableKeepAlives)
-	require.Equal(t, 10, transport.MaxIdleConns)
-	require.Equal(t, 20, transport.MaxIdleConnsPerHost)
-	require.Equal(t, 30*time.Second, transport.IdleConnTimeout)
+	require.NoError(t, authenticator.Start(t.Context(), extensionsHost{nestedAuthenticatorID(): nestedAuth}), "nested authenticator resolution must succeed")
+
+	roundTripper, err := authenticator.RoundTripper(base)
+	require.NoError(t, err, "nested transport composition must succeed")
+	require.Same(t, base, nestedAuth.base, "nested authenticator must receive the consumer-supplied base transport")
+
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://es.example:9200", nil)
+	require.NoError(t, err, "request creation must succeed")
+	response, err := roundTripper.RoundTrip(request)
+	require.NoError(t, err, "composed request must succeed")
+	require.NoError(t, response.Body.Close(), "response body must close")
+	require.Equal(t, "nested", base.request.Header.Get("X-Nested"), "nested transport must participate in the request")
+	require.Equal(t, "extension", base.request.Header.Get("X-Extension"), "destination headers must wrap the nested transport")
+
+	_, exposesClose := roundTripper.(interface{ CloseIdleConnections() })
+	require.False(t, exposesClose, "elasticsearchauth wrapper must not expose nested transport lifecycle operations")
 }
 
 func TestAuthenticationRoundTrip(t *testing.T) {
@@ -312,311 +270,207 @@ func TestAuthenticationRoundTrip(t *testing.T) {
 			expectAuth: "Basic " + base64.StdEncoding.EncodeToString([]byte("elastic:password")),
 		},
 		{
-			name: "unauthenticated",
+			name: "unauthenticated destination",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			type receivedAuth struct {
-				authorization string
-				extension     string
-			}
-			received := make(chan receivedAuth, 1)
-
-			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-				received <- receivedAuth{
-					authorization: request.Header.Get("Authorization"),
-					extension:     request.Header.Get("X-Extension"),
-				}
-
-				response.WriteHeader(http.StatusNoContent)
-			}))
-			defer server.Close()
-
+			base := &recordingRoundTripper{}
 			config := validConfig()
-			config.Endpoints = []string{server.URL}
-			config.ClientConfig.Headers = configopaque.MapList{{Name: "X-Extension", Value: "extension"}}
+			config.Headers = configopaque.MapList{
+				{Name: "Host", Value: "destination.example"},
+				{Name: "X-Extension", Value: "extension"},
+			}
 			if test.configure != nil {
 				test.configure(config)
 			}
-
 			authenticator := createTestExtension(t, config)
-			roundTripper, err := authenticator.RoundTripper(failingRoundTripper{})
-			require.NoError(t, err, "RoundTripper construction must succeed")
+			roundTripper, err := authenticator.RoundTripper(base)
+			require.NoError(t, err, "simple mode must wrap the supplied base transport without Start")
 
-			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://es.example:9200", nil)
 			require.NoError(t, err, "request creation must succeed")
-
 			request.Header.Set("X-Caller", "caller")
 			response, err := roundTripper.RoundTrip(request)
 			require.NoError(t, err, "authenticated request must succeed")
 			require.NoError(t, response.Body.Close(), "response body must close")
 
-			actual := <-received
-			require.Equal(t, test.expectAuth, actual.authorization, "transport must inject configured authentication")
-			require.Equal(t, "extension", actual.extension, "transport must inject configured headers")
-
+			require.Equal(t, test.expectAuth, base.request.Header.Get("Authorization"), "configured Elasticsearch credentials must be applied")
+			require.Equal(t, "extension", base.request.Header.Get("X-Extension"), "destination headers must be applied")
+			require.Equal(t, "destination.example", base.request.Host, "destination Host override must be applied")
 			require.Empty(t, request.Header.Get("Authorization"), "caller request must not gain authentication")
-			require.Empty(t, request.Header.Get("X-Extension"), "caller request must not gain extension headers")
-			require.Equal(t, "caller", request.Header.Get("X-Caller"), "caller request headers must remain unchanged")
+			require.Empty(t, request.Header.Get("X-Extension"), "caller request must not gain destination headers")
+			require.Equal(t, "caller", request.Header.Get("X-Caller"), "caller headers must remain unchanged")
 		})
 	}
 }
 
-func TestCreateExtensionTLSPreflight(t *testing.T) {
+func TestNestedAuthenticatorResolutionErrors(t *testing.T) {
 	tests := []struct {
-		name          string
-		configure     func(t *testing.T, config *Config)
-		validateError string
-		createError   string
+		name       string
+		extensions map[component.ID]component.Component
+		errText    string
 	}{
 		{
-			name: "valid CA and client certificate material",
-			configure: func(t *testing.T, config *Config) {
-				ca, cert := generateCAAndCertificate(t)
-				config.ClientConfig.TLS.CAFile = writePEMCertificate(t, "ca.pem", ca.Certificate[0])
-				config.ClientConfig.TLS.CertFile, config.ClientConfig.TLS.KeyFile = writeCertificateAndKey(t, cert)
-			},
+			name:    "missing extension",
+			errText: `failed to resolve authenticator "beatsauth/default": authenticator not found`,
 		},
 		{
-			name: "missing CA file is only rejected during creation",
-			configure: func(t *testing.T, config *Config) {
-				config.ClientConfig.TLS.CAFile = filepath.Join(t.TempDir(), "missing-ca.pem")
+			name: "wrong extension type",
+			extensions: map[component.ID]component.Component{
+				nestedAuthenticatorID(): &nonHTTPClientExtension{},
 			},
-			createError: "invalid Elasticsearch TLS configuration",
-		},
-		{
-			name: "malformed CA file",
-			configure: func(t *testing.T, config *Config) {
-				path := filepath.Join(t.TempDir(), "ca.pem")
-				require.NoError(t, os.WriteFile(path, []byte("not a certificate"), 0o600), "malformed CA fixture must write")
-				config.ClientConfig.TLS.CAFile = path
-			},
-			createError: "invalid Elasticsearch TLS configuration",
-		},
-		{
-			name: "mismatched client certificate and key",
-			configure: func(t *testing.T, config *Config) {
-				_, certA := generateCAAndCertificate(t)
-				_, certB := generateCAAndCertificate(t)
-				config.ClientConfig.TLS.CertFile, _ = writeCertificateAndKey(t, certA)
-				_, config.ClientConfig.TLS.KeyFile = writeCertificateAndKey(t, certB)
-			},
-			createError: "invalid Elasticsearch TLS configuration",
+			errText: "requested authenticator is not a HTTP client authenticator",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			config := validConfig()
-			test.configure(t, config)
-			err := config.Validate()
-			if test.validateError == "" {
-				require.NoError(t, err, "Validate must remain independent of TLS files")
-			} else {
-				require.ErrorContains(t, err, test.validateError, "Validate must report structural configuration errors")
-			}
-
-			_, err = createExtension(t.Context(), extension.Settings{ID: component.NewID(Type)}, config)
-			if test.createError == "" {
-				require.NoError(t, err, "valid TLS material must pass creation preflight")
-			} else {
-				require.ErrorContains(t, err, test.createError, "creation must preflight TLS files")
-			}
+			config.Auth = configoptional.Some(configauth.Config{AuthenticatorID: nestedAuthenticatorID()})
+			authenticator := createTestExtension(t, config)
+			err := authenticator.Start(t.Context(), extensionsHost(test.extensions))
+			require.ErrorContains(t, err, test.errText, "Start must report invalid nested authenticator configuration")
 		})
 	}
 }
 
-func TestCustomCATLSRequest(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		response.WriteHeader(http.StatusTeapot)
-	}))
-	defer server.Close()
-
-	certificate := server.Certificate()
+func TestNestedAuthenticatorRejectsSelfReference(t *testing.T) {
+	id := component.NewID(Type)
 	config := validConfig()
-	config.Endpoints = []string{server.URL}
-	config.ClientConfig.TLS.CAFile = writePEMCertificate(t, "server-ca.pem", certificate.Raw)
-
+	config.Auth = configoptional.Some(configauth.Config{AuthenticatorID: id})
 	authenticator := createTestExtension(t, config)
 
-	roundTripper, err := authenticator.RoundTripper(nil)
-	require.NoError(t, err, "RoundTripper construction must succeed")
-
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
-	require.NoError(t, err, "request creation must succeed")
-
-	response, err := roundTripper.RoundTrip(request)
-	require.NoError(t, err, "configured custom CA must trust HTTPS server")
-	require.Equal(t, http.StatusTeapot, response.StatusCode, "HTTPS request must reach the test handler")
-	require.NoError(t, response.Body.Close(), "response body must close")
+	err := authenticator.Start(t.Context(), extensionsHost{id: authenticator})
+	require.ErrorContains(t, err, "cannot reference itself", "Start must reject recursive self-reference")
 }
 
-func TestProxyURLRouting(t *testing.T) {
-	receivedURL := make(chan string, 1)
-	proxy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		receivedURL <- request.URL.String()
-		response.WriteHeader(http.StatusNoContent)
-	}))
-	defer proxy.Close()
+func TestRoundTripperDefaultsNilBaseWithoutNestedAuthenticator(t *testing.T) {
+	base := &recordingRoundTripper{}
+	originalDefaultTransport := http.DefaultTransport
+	http.DefaultTransport = base
+	t.Cleanup(func() {
+		http.DefaultTransport = originalDefaultTransport
+	})
 
-	config := validConfig()
-	config.ClientConfig.ProxyURL = proxy.URL
-	authenticator := createTestExtension(t, config)
+	authenticator := createTestExtension(t, validConfig())
 	roundTripper, err := authenticator.RoundTripper(nil)
-	require.NoError(t, err, "proxy transport construction must succeed")
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://unreachable.invalid/_cluster/health", nil)
+	require.NoError(t, err, "simple mode must accept a nil base transport")
+
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://es.example:9200", nil)
 	require.NoError(t, err, "request creation must succeed")
 	response, err := roundTripper.RoundTrip(request)
-	require.NoError(t, err, "request must route through configured proxy")
+	require.NoError(t, err, "request must use http.DefaultTransport")
 	require.NoError(t, response.Body.Close(), "response body must close")
-	require.Equal(t, "http://unreachable.invalid/_cluster/health", <-receivedURL, "proxy must receive absolute request URL")
+	require.NotNil(t, base.request, "http.DefaultTransport must receive the request")
+	require.Equal(t, request.URL, base.request.URL, "http.DefaultTransport must receive the destination URL")
 }
 
-func TestRoundTripperConstructionOwnership(t *testing.T) {
-	config := validConfig()
-	config.Endpoints = []string{"http://127.0.0.1:1"}
-	authenticator := createTestExtension(t, config)
-	first, err := authenticator.RoundTripper(failingRoundTripper{})
-	require.NoError(t, err, "transport construction must not dial Elasticsearch")
-	second, err := authenticator.RoundTripper(failingRoundTripper{})
-	require.NoError(t, err, "each transport construction must remain offline")
-	firstAuth, ok := first.(*authenticatedRoundTripper)
-	require.True(t, ok, "extension must return its request-cloning wrapper")
-	secondAuth, ok := second.(*authenticatedRoundTripper)
-	require.True(t, ok, "extension must return its request-cloning wrapper")
-	require.NotSame(t, firstAuth.transport, secondAuth.transport, "each consumer must own an independent transport")
-	require.Equal(t, config.Endpoints, authenticator.Endpoints(), "endpoints must remain configured")
-}
-
-func TestRoundTripperCloseIdleConnections(t *testing.T) {
-	transport := &closeTrackingRoundTripper{}
-	roundTripper := &authenticatedRoundTripper{transport: transport, config: validConfig()}
-	roundTripper.CloseIdleConnections()
-	require.Equal(t, 1, transport.closeCalls, "wrapper must forward consumer pool cleanup")
+func TestEndpointsReturnsCopy(t *testing.T) {
+	authenticator := createTestExtension(t, validConfig())
+	endpoints := authenticator.Endpoints()
+	endpoints[0] = "https://changed.example:9200"
+	require.Equal(t, []string{"https://es.example:9200"}, authenticator.Endpoints(), "callers must not mutate configured endpoints")
 }
 
 func TestCredentialRedaction(t *testing.T) {
-	tests := []struct {
-		name            string
-		configure       func(*Config)
-		secrets         []string
-		validationError bool
-	}{
-		{
-			name: "malformed API key validation error",
-			configure: func(config *Config) {
-				config.APIKey = "do-not-log-malformed-api-key"
-			},
-			secrets:         []string{"do-not-log-malformed-api-key"},
-			validationError: true,
-		},
-		{
-			name: "basic authentication construction error",
-			configure: func(config *Config) {
-				config.User = "elastic"
-				config.Password = "do-not-log-password"
-				config.ClientConfig.TLS.CAFile = filepath.Join(t.TempDir(), "missing-ca.pem")
-			},
-			secrets: []string{"do-not-log-password"},
-		},
-		{
-			name: "API key construction error",
-			configure: func(config *Config) {
-				config.APIKey = configopaque.String(base64.StdEncoding.EncodeToString([]byte("id:do-not-log-api-key")))
-				config.ClientConfig.TLS.CAFile = filepath.Join(t.TempDir(), "missing-ca.pem")
-			},
-			secrets: []string{base64.StdEncoding.EncodeToString([]byte("id:do-not-log-api-key"))},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			config := validConfig()
-			test.configure(config)
-			err := config.Validate()
-			if test.validationError {
-				require.Error(t, err, "invalid credentials must fail validation")
-			} else {
-				require.NoError(t, err, "valid credentials must pass structural validation")
-				extension, createErr := createExtension(t.Context(), extension.Settings{ID: component.NewID(Type)}, config)
-				require.Nil(t, extension, "TLS preflight must fail before extension construction")
-				require.Error(t, createErr, "missing TLS material must fail construction")
-				err = createErr
-			}
-			formatted := fmt.Sprintf("%+v", config)
-			for _, secret := range test.secrets {
-				require.NotContains(t, err.Error(), secret, "validation errors must not expose credentials")
-				require.NotContains(t, formatted, secret, "formatted configuration must redact credentials")
-			}
-		})
-	}
+	config := validConfig()
+	config.Password = "do-not-log-password"
+	config.User = "elastic"
+	config.Headers = configopaque.MapList{{Name: "X-Secret", Value: "do-not-log-header"}}
+	formatted := fmt.Sprintf("%+v", config)
+	require.NotContains(t, formatted, "do-not-log-password", "formatted configuration must redact passwords")
+	require.NotContains(t, formatted, "do-not-log-header", "formatted configuration must redact destination headers")
+
+	config.Password = ""
+	config.User = ""
+	config.APIKey = "do-not-log-malformed-api-key"
+	err := config.Validate()
+	require.Error(t, err, "malformed API key must fail validation")
+	require.NotContains(t, err.Error(), "do-not-log-malformed-api-key", "validation error must not expose API keys")
 }
 
 func validConfig() *Config {
-	defaultConfig := createDefaultConfig()
-	config, ok := defaultConfig.(*Config)
-	if !ok {
-		panic("elasticsearchauth default config has unexpected type")
-	}
 	return &Config{
-		ClientConfig: config.ClientConfig,
-		Endpoints:    []string{"https://es.example:9200"},
+		Endpoints: []string{"https://es.example:9200"},
 	}
+}
+
+func nestedAuthenticatorID() component.ID {
+	return component.MustNewIDWithName("beatsauth", "default")
 }
 
 func createTestExtension(t *testing.T, config *Config) *authenticator {
 	t.Helper()
-	extension, err := createExtension(t.Context(), extension.Settings{ID: component.NewID(Type)}, config)
+	created, err := createExtension(t.Context(), extension.Settings{ID: component.NewID(Type)}, config)
 	require.NoError(t, err, "extension creation must succeed")
-	authenticator, ok := extension.(*authenticator)
+	authenticator, ok := created.(*authenticator)
 	require.True(t, ok, "created extension must be authenticator")
 	return authenticator
 }
 
-func generateCAAndCertificate(t *testing.T) (tls.Certificate, tls.Certificate) {
+func decodeYAML(t *testing.T, value string) map[string]any {
 	t.Helper()
-	ca, err := tlscommontest.GenCA()
-	require.NoError(t, err, "CA generation must succeed")
-	certificate, err := tlscommontest.GenSignedCert(ca, x509.KeyUsageDigitalSignature, false, "localhost", nil, []net.IP{net.IPv4(127, 0, 0, 1)}, false)
-	require.NoError(t, err, "certificate generation must succeed")
-	return ca, certificate
+	var raw map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(value), &raw), "YAML fixture must decode")
+	return raw
 }
 
-func writePEMCertificate(t *testing.T, name string, rawCertificate []byte) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
-	contents := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rawCertificate})
-	require.NoError(t, os.WriteFile(path, contents, 0o600), "certificate fixture must write")
-	return path
+type extensionsHost map[component.ID]component.Component
+
+func (h extensionsHost) GetExtensions() map[component.ID]component.Component {
+	return h
 }
 
-func writeCertificateAndKey(t *testing.T, certificate tls.Certificate) (string, string) {
-	t.Helper()
-	directory := t.TempDir()
-	certPath := filepath.Join(directory, "cert.pem")
-	keyPath := filepath.Join(directory, "key.pem")
-	key, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
-	require.NoError(t, err, "private key marshal must succeed")
-	require.NoError(t, os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]}), 0o600), "certificate fixture must write")
-	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600), "private key fixture must write")
-	return certPath, keyPath
+type nonHTTPClientExtension struct{}
+
+func (*nonHTTPClientExtension) Start(context.Context, component.Host) error {
+	return nil
 }
 
-type failingRoundTripper struct{}
-
-func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, fmt.Errorf("base transport must not be used")
+func (*nonHTTPClientExtension) Shutdown(context.Context) error {
+	return nil
 }
 
-type closeTrackingRoundTripper struct {
-	closeCalls int
+type testHTTPClientAuthenticator struct {
+	base http.RoundTripper
+	wrap func(http.RoundTripper) http.RoundTripper
 }
 
-func (*closeTrackingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, fmt.Errorf("round trip is not used by close test")
+func (*testHTTPClientAuthenticator) Start(context.Context, component.Host) error {
+	return nil
 }
 
-func (c *closeTrackingRoundTripper) CloseIdleConnections() {
-	c.closeCalls++
+func (*testHTTPClientAuthenticator) Shutdown(context.Context) error {
+	return nil
 }
+
+func (a *testHTTPClientAuthenticator) RoundTripper(base http.RoundTripper) (http.RoundTripper, error) {
+	a.base = base
+	return a.wrap(base), nil
+}
+
+type nestedRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (n *nestedRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	request.Header.Set("X-Nested", "nested")
+	return n.base.RoundTrip(request)
+}
+
+type recordingRoundTripper struct {
+	request *http.Request
+}
+
+func (r *recordingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	r.request = request
+	return &http.Response{
+		StatusCode: http.StatusNoContent,
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    request,
+	}, nil
+}
+
+func (*recordingRoundTripper) CloseIdleConnections() {}

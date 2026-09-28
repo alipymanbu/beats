@@ -1,28 +1,53 @@
 # Elasticsearch authentication extension
 
 `elasticsearchauth` is a Development OTel `extensionauth.HTTPClient` authenticator
-for Elasticsearch consumers. It exposes resolved `endpoints`, creates a fresh
-consumer-owned HTTP transport for every `RoundTripper` call.
+for Elasticsearch consumers. It owns only resolved Elasticsearch endpoints,
+destination headers, and Basic/API-key credentials.
+
+Simple mode uses the consumer-supplied base transport directly:
 
 ```yaml
 extensions:
   elasticsearchauth/default:
     endpoints: [https://es.example:9200]
-    api_key: <base64-encoded-id:key>
-    tls:
-      ca_file: /path/to/ca.pem
+    user: elastic
+    password: ${env:ELASTICSEARCH_PASSWORD}
+    headers:
+      X-Elastic-Product-Origin: custom
+```
+
+Delegated mode configures `beatsauth` when transport-specific settings are
+needed:
+
+```yaml
+extensions:
+  beatsauth/default:
+    ssl:
+      certificate_authorities: [/path/to/ca.pem]
     proxy_url: https://proxy.example:8443
+
+  elasticsearchauth/default:
+    endpoints: [https://es.example:9200]
+    api_key: <base64-encoded-id:key>
+    headers:
+      X-Elastic-Product-Origin: custom
+    auth:
+      authenticator: beatsauth/default
 ```
 
 Only plural `endpoints` is accepted. Each must be a fully resolved HTTP(S) URL.
 `api_key` is base64-encoded `id:key`; alternatively configure both `user` and
 `password`. Endpoint userinfo cannot be combined with explicit
-credentials. Consumers own request deadlines.
+credentials or an `Authorization` destination header.
 
-TLS files are loaded and validated when the extension is created. Certificate
-rotation after creation is not supported. TLS, proxy, headers, pool,
-keepalive, and HTTP/2 settings are authoritative here and do not come
-from the base transport passed to `RoundTripper`.
+Without `auth`, `RoundTripper` wraps the consumer-supplied base transport
+directly. With `auth`, it passes that base transport to the configured
+authenticator and wraps the returned transport. In both modes, the outer
+wrapper applies Elasticsearch credentials and destination headers and does not
+expose transport lifecycle operations. Configure TLS, certificate behavior,
+proxies, dialing, keepalive, Kerberos, and every other transport concern on
+`beatsauth`; transport fields on `elasticsearchauth` are rejected by strict
+configuration decoding.
 
 ## Elasticsearch output compatibility
 
@@ -30,10 +55,8 @@ from the base transport passed to `RoundTripper`.
 | --- | --- |
 | `hosts`, `protocol`, `path`, query parameters, Cloud ID, env substitutions | Configure their fully resolved results as plural `endpoints`; the extension does not perform endpoint resolution. |
 | `username`/`password`, `api_key` | Configure either `user` and `password`, or a base64-encoded `api_key`; the mechanisms are mutually exclusive. |
-| TLS CA/certificate/key, `insecure`, server name | Configure the equivalent OTel `tls` fields; the extension loads and validates TLS files when created. |
-| `proxy_url` | Configure the OTel field of the same name. |
-| `headers` | Configure OTel `headers`. |
-| connection pool, keepalive, HTTP/2 values | Configure the corresponding OTel `confighttp` fields. |
-| output `timeout` | Not supported by the extension; consumers own request deadlines. |
-| `proxy_headers`, `proxy_disable` | Unsupported by the initial contract; remove or replace these settings before configuring the extension. |
-| `ca_trusted_fingerprint`, nonstandard TLS verification modes | Unsupported by the initial contract; provide equivalent standard OTel `tls` configuration where possible. |
+| `headers` | Configure `headers` directly on `elasticsearchauth`; an `Authorization` header cannot be combined with Basic/API-key credentials. |
+| TLS, certificate reload, `ca_trusted_fingerprint`, verification modes | Configure on an optional `beatsauth` extension and reference it through `auth.authenticator`. |
+| `proxy_url`, `proxy_headers`, `proxy_disable` | Configure on an optional `beatsauth` extension and reference it through `auth.authenticator`. |
+| dialing, connection pool, keepalive, Kerberos | Configure on an optional `beatsauth` extension and reference it through `auth.authenticator`. |
+| nested HTTP client authentication | Omit `auth` for simple mode, or configure `auth.authenticator` with the component ID of a transport-owning `beatsauth` extension. |
