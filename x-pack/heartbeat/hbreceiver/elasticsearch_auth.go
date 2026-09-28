@@ -16,11 +16,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.elastic.co/apm/module/apmelasticsearch/v2"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension/extensionauth"
 
 	"github.com/elastic/beats/v7/heartbeat/beater"
 	"github.com/elastic/beats/v7/heartbeat/monitors/wrappers/monitorstate"
+	"github.com/elastic/beats/v7/libbeat/version"
+	"github.com/elastic/elastic-agent-libs/useragent"
 )
 
 const elasticsearchRequestTimeout = 10 * time.Second
@@ -33,12 +36,13 @@ type elasticsearchAuthExtension interface {
 type esClient struct {
 	endpoints []*url.URL
 	client    *http.Client
+	userAgent string
 	next      atomic.Uint64
 }
 
 var _ monitorstate.ElasticsearchRequester = (*esClient)(nil)
 
-func elasticsearchAuthStartHook(reference string, heartbeat *beater.Heartbeat, setRequester func(*esClient)) func(component.Host) error {
+func elasticsearchAuthStartHook(reference string, heartbeat *beater.Heartbeat, userAgent string, setRequester func(*esClient)) func(component.Host) error {
 	return func(host component.Host) error {
 		if reference == "" {
 			return nil
@@ -66,7 +70,7 @@ func elasticsearchAuthStartHook(reference string, heartbeat *beater.Heartbeat, s
 			return fmt.Errorf("heartbeat instance was not captured for elasticsearch_auth extension %q", extensionID.String())
 		}
 
-		requester, err := newESClient(auth)
+		requester, err := newESClient(auth, userAgent)
 		if err != nil {
 			return fmt.Errorf("creating Elasticsearch requester from extension %q: %w", extensionID.String(), err)
 		}
@@ -76,7 +80,7 @@ func elasticsearchAuthStartHook(reference string, heartbeat *beater.Heartbeat, s
 	}
 }
 
-func newESClient(auth elasticsearchAuthExtension) (*esClient, error) {
+func newESClient(auth elasticsearchAuthExtension, userAgent string) (*esClient, error) {
 	endpoints := auth.Endpoints()
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("extension has no endpoints")
@@ -95,12 +99,17 @@ func newESClient(auth elasticsearchAuthExtension) (*esClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating authenticated transport: %w", err)
 	}
+	if userAgent == "" {
+		userAgent = useragent.UserAgent("Heartbeat", version.GetDefaultVersion(), version.Commit(), version.BuildTime().String())
+	}
+	// Keep Elasticsearch requests instrumented the same way as eslegclient.
 	return &esClient{
 		endpoints: parsedEndpoints,
+		userAgent: userAgent,
 		// elasticsearchauth intentionally does not own request deadlines; Heartbeat
 		// keeps the 10-second deadline used by its prior Elasticsearch requester.
 		client: &http.Client{
-			Transport: roundTripper,
+			Transport: apmelasticsearch.WrapRoundTripper(roundTripper),
 			Timeout:   elasticsearchRequestTimeout,
 		},
 	}, nil
@@ -131,6 +140,7 @@ func (e *esClient) Request(method, path, pipeline string, params map[string]stri
 		if body != nil {
 			request.Header.Set("Content-Type", "application/json")
 		}
+		request.Header.Set("User-Agent", e.userAgent)
 
 		response, err := e.client.Do(request)
 		if err != nil {

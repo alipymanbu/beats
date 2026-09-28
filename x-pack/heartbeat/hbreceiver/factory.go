@@ -91,6 +91,7 @@ func createReceiver(ctx context.Context, set receiver.Settings, baseCfg componen
 		elasticsearchAuthStartHook(
 			cfg.ElasticsearchAuth,
 			creator.heartbeat,
+			b.Info.UserAgent,
 			func(requester *esClient) {
 				hbReceiver.elasticsearchAuthRequester = requester
 			},

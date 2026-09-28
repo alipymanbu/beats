@@ -108,7 +108,7 @@ func TestElasticsearchAuthStartHookErrors(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := elasticsearchAuthStartHook(test.reference, nil, func(*esClient) {})(test.host)
+			err := elasticsearchAuthStartHook(test.reference, nil, "", func(*esClient) {})(test.host)
 			require.Error(t, err, "start hook should reject an invalid Elasticsearch authentication extension")
 			assert.Contains(t, err.Error(), test.wantError, "start hook should return the expected resolver error")
 		})
@@ -116,7 +116,7 @@ func TestElasticsearchAuthStartHookErrors(t *testing.T) {
 }
 
 func TestElasticsearchAuthStartHookEmptyReference(t *testing.T) {
-	require.NoError(t, elasticsearchAuthStartHook("", nil, func(*esClient) {})(nil), "empty Elasticsearch auth reference should be a no-op")
+	require.NoError(t, elasticsearchAuthStartHook("", nil, "", func(*esClient) {})(nil), "empty Elasticsearch auth reference should be a no-op")
 }
 
 func TestESClientRequest(t *testing.T) {
@@ -134,7 +134,7 @@ func TestESClientRequest(t *testing.T) {
 		}),
 	}
 
-	client, err := newESClient(auth)
+	client, err := newESClient(auth, "Heartbeat/test-agent")
 	require.NoError(t, err, "client creation")
 	assert.Equal(t, elasticsearchRequestTimeout, client.client.Timeout, "Heartbeat must own the Elasticsearch request deadline")
 	status, body, err := client.Request(http.MethodPost, "/_search?size=1", "pipeline", map[string]string{"routing": "monitor"}, map[string]string{"query": "state"})
@@ -148,12 +148,15 @@ func TestESClientRequest(t *testing.T) {
 	assert.Equal(t, "pipeline", receivedRequest.URL.Query().Get("pipeline"), "unexpected pipeline query")
 	assert.Equal(t, "monitor", receivedRequest.URL.Query().Get("routing"), "unexpected routing query")
 	assert.Equal(t, "application/json", receivedRequest.Header.Get("Content-Type"), "unexpected content type")
+	assert.Equal(t, "Heartbeat/test-agent", receivedRequest.Header.Get("User-Agent"), "unexpected User-Agent")
 }
 
 func TestESClientRequestNon2xx(t *testing.T) {
+	var receivedUserAgent string
 	auth := &fakeElasticsearchAuthExtension{
 		endpoints: []string{"http://example.test"},
-		roundTripper: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		roundTripper: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			receivedUserAgent = request.Header.Get("User-Agent")
 			return &http.Response{
 				StatusCode: http.StatusTeapot,
 				Status:     "418 I'm a teapot",
@@ -163,12 +166,13 @@ func TestESClientRequestNon2xx(t *testing.T) {
 		}),
 	}
 
-	client, err := newESClient(auth)
+	client, err := newESClient(auth, "")
 	require.NoError(t, err, "client creation")
 	status, body, err := client.Request(http.MethodGet, "/", "", nil, nil)
 	require.EqualError(t, err, `418 I'm a teapot: Brewing error`, "unexpected error message")
 	assert.Equal(t, http.StatusTeapot, status, "unexpected status code")
 	assert.Equal(t, "Brewing error", string(body), "unexpected response body")
+	assert.Contains(t, receivedUserAgent, "Heartbeat/", "fallback User-Agent should identify Heartbeat")
 }
 
 func TestElasticsearchAuthStartHookInjectsBeforeRun(t *testing.T) {
