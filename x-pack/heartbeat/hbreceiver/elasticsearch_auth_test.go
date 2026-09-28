@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/collector/receiver"
 	"go.uber.org/zap"
 
+	"github.com/elastic/beats/v7/libbeat/common/productorigin"
 	"github.com/elastic/beats/v7/libbeat/management"
 )
 
@@ -148,7 +149,38 @@ func TestESClientRequest(t *testing.T) {
 	assert.Equal(t, "pipeline", receivedRequest.URL.Query().Get("pipeline"), "unexpected pipeline query")
 	assert.Equal(t, "monitor", receivedRequest.URL.Query().Get("routing"), "unexpected routing query")
 	assert.Equal(t, "application/json", receivedRequest.Header.Get("Content-Type"), "unexpected content type")
+	assert.Equal(t, "application/json", receivedRequest.Header.Get("Accept"), "unexpected Accept header")
+	assert.Equal(t, productorigin.Beats, receivedRequest.Header.Get(productorigin.Header), "unexpected product origin header")
 	assert.Equal(t, "Heartbeat/test-agent", receivedRequest.Header.Get("User-Agent"), "unexpected User-Agent")
+}
+
+func TestESClientRequestConfiguredHeadersOverrideDefaults(t *testing.T) {
+	var receivedRequest *http.Request
+	auth := &fakeElasticsearchAuthExtension{
+		endpoints: []string{"http://example.test"},
+		roundTripper: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			// elasticsearchauth applies configured headers in its transport, after
+			// the requester has supplied its defaults.
+			request = request.Clone(request.Context())
+			request.Header.Set("Accept", "application/vnd.elasticsearch+json;compatible-with=8")
+			request.Header.Set(productorigin.Header, "custom-origin")
+			receivedRequest = request
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(bytes.NewBufferString(`{}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	client, err := newESClient(auth, "Heartbeat/test-agent")
+	require.NoError(t, err, "client creation")
+	_, _, err = client.Request(http.MethodGet, "/", "", nil, nil)
+	require.NoError(t, err, "request should succeed")
+	require.NotNil(t, receivedRequest, "returned request should be valid")
+	assert.Equal(t, "application/vnd.elasticsearch+json;compatible-with=8", receivedRequest.Header.Get("Accept"), "configured Accept header should override the default")
+	assert.Equal(t, "custom-origin", receivedRequest.Header.Get(productorigin.Header), "configured product origin should override the default")
 }
 
 func TestESClientRequestNon2xx(t *testing.T) {

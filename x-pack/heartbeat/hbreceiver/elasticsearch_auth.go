@@ -22,6 +22,7 @@ import (
 
 	"github.com/elastic/beats/v7/heartbeat/beater"
 	"github.com/elastic/beats/v7/heartbeat/monitors/wrappers/monitorstate"
+	"github.com/elastic/beats/v7/libbeat/common/productorigin"
 	"github.com/elastic/beats/v7/libbeat/version"
 	"github.com/elastic/elastic-agent-libs/useragent"
 )
@@ -140,6 +141,8 @@ func (e *esClient) Request(method, path, pipeline string, params map[string]stri
 		if body != nil {
 			request.Header.Set("Content-Type", "application/json")
 		}
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set(productorigin.Header, productorigin.Beats)
 		request.Header.Set("User-Agent", e.userAgent)
 
 		response, err := e.client.Do(request)
