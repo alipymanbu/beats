@@ -173,7 +173,7 @@ func (e *esClient) Request(method, path, pipeline string, params map[string]stri
 			return response.StatusCode, nil, fmt.Errorf("reading Elasticsearch response: %w", readErr)
 		}
 		if closeErr != nil {
-			return response.StatusCode, nil, fmt.Errorf("closing Elasticsearch response: %w", closeErr)
+			return response.StatusCode, responseBody, fmt.Errorf("closing Elasticsearch response: %w", closeErr)
 		}
 
 		if response.StatusCode > 299 {
