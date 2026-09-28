@@ -242,7 +242,6 @@ func TestConfigYAMLDecode(t *testing.T) {
 	tests := []struct {
 		name            string
 		yaml            string
-		decodeError     string
 		expectEndpoints []string
 		expectUser      string
 		expectPassword  configopaque.String
@@ -269,120 +268,6 @@ keepalive:
 			expectHeader:    "value",
 			expectIdle:      5 * time.Second,
 		},
-		{
-			name: "singular endpoint",
-			yaml: `
-endpoints: [https://es.example:9200]
-endpoint: https://other.example:9200
-`,
-			decodeError: "endpoint is unsupported",
-		},
-		{
-			name: "null endpoint",
-			yaml: `
-endpoints: [https://es.example:9200]
-endpoint: null
-`,
-			decodeError: "endpoint is unsupported",
-		},
-		{
-			name: "timeout",
-			yaml: `
-endpoints: [https://es.example:9200]
-timeout: 1s
-`,
-			decodeError: "timeout is unsupported",
-		},
-		{
-			name: "zero timeout",
-			yaml: `
-endpoints: [https://es.example:9200]
-timeout: 0s
-`,
-			decodeError: "timeout is unsupported",
-		},
-		{
-			name: "nested auth",
-			yaml: `
-endpoints: [https://es.example:9200]
-auth:
-  authenticator: basicauth/default
-`,
-			decodeError: "nested auth",
-		},
-		{
-			name: "null auth",
-			yaml: `
-endpoints: [https://es.example:9200]
-auth: null
-`,
-			decodeError: "nested auth",
-		},
-		{
-			name: "middleware",
-			yaml: `
-endpoints: [https://es.example:9200]
-middlewares:
-  - id: basicauth/default
-`,
-			decodeError: "middlewares are unsupported",
-		},
-		{
-			name: "empty middlewares",
-			yaml: `
-endpoints: [https://es.example:9200]
-middlewares: []
-`,
-			decodeError: "middlewares are unsupported",
-		},
-		{
-			name: "cookies",
-			yaml: `
-endpoints: [https://es.example:9200]
-cookies: {}
-`,
-			decodeError: "cookies are unsupported",
-		},
-		{
-			name: "null cookies",
-			yaml: `
-endpoints: [https://es.example:9200]
-cookies: null
-`,
-			decodeError: "cookies are unsupported",
-		},
-		{
-			name: "compression",
-			yaml: `
-endpoints: [https://es.example:9200]
-compression: gzip
-`,
-			decodeError: "compression is unsupported",
-		},
-		{
-			name: "empty compression",
-			yaml: `
-endpoints: [https://es.example:9200]
-compression: ''
-`,
-			decodeError: "compression is unsupported",
-		},
-		{
-			name: "empty compression parameters",
-			yaml: `
-endpoints: [https://es.example:9200]
-compression_params: {}
-`,
-			decodeError: "compression_params are unsupported",
-		},
-		{
-			name: "unknown key",
-			yaml: `
-endpoints: [https://es.example:9200]
-unknown_key: value
-`,
-			decodeError: "unsupported configuration key",
-		},
 	}
 
 	for _, test := range tests {
@@ -394,12 +279,7 @@ unknown_key: value
 			config, ok := defaultConfig.(*Config)
 			require.True(t, ok, "default configuration must be Config")
 
-			err := confmap.NewFromStringMap(raw).Unmarshal(config)
-			if test.decodeError != "" {
-				require.ErrorContains(t, err, test.decodeError, "unsupported or unknown configuration must fail decoding")
-				return
-			}
-			require.NoError(t, err, "Collector confmap must decode extension configuration")
+			require.NoError(t, confmap.NewFromStringMap(raw).Unmarshal(config), "Collector confmap must decode extension configuration")
 
 			expectedEndpoints := test.expectEndpoints
 			if expectedEndpoints == nil {

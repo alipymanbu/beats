@@ -15,7 +15,6 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/config/configopaque"
-	"go.opentelemetry.io/collector/confmap"
 )
 
 // Config configures the Elasticsearch authentication extension.
@@ -39,66 +38,8 @@ type Config struct {
 	APIKey configopaque.String `mapstructure:"api_key"`
 }
 
-var supportedConfigFields = map[string]struct{}{
-	"api_key":                 {},
-	"disable_keep_alives":     {},
-	"endpoints":               {},
-	"force_attempt_http2":     {},
-	"headers":                 {},
-	"http2_ping_timeout":      {},
-	"http2_read_idle_timeout": {},
-	"idle_conn_timeout":       {},
-	"keepalive":               {},
-	"max_conns_per_host":      {},
-	"max_idle_conns":          {},
-	"max_idle_conns_per_host": {},
-	"password":                {},
-	"proxy_url":               {},
-	"read_buffer_size":        {},
-	"tls":                     {},
-	"user":                    {},
-	"write_buffer_size":       {},
-}
-
-var unsupportedConfigFields = map[string]struct{}{
-	"auth":               {},
-	"compression":        {},
-	"compression_params": {},
-	"cookies":            {},
-	"endpoint":           {},
-	"middlewares":        {},
-	"timeout":            {},
-}
-
 func createDefaultConfig() component.Config {
 	return &Config{ClientConfig: confighttp.NewDefaultClientConfig()}
-}
-
-// Unmarshal preserves confighttp's custom nested unmarshaling while rejecting
-// fields that this extension intentionally does not support.
-func (c *Config) Unmarshal(conf *confmap.Conf) error {
-	for _, key := range conf.AllKeys() {
-		field, _, _ := strings.Cut(key, confmap.KeyDelimiter)
-		if _, unsupported := unsupportedConfigFields[field]; unsupported {
-			return unsupportedFieldError(field)
-		}
-		if _, known := supportedConfigFields[field]; !known {
-			return fmt.Errorf("unsupported configuration key %q", field)
-		}
-	}
-
-	decoded := configWithoutUnmarshal{ClientConfig: c.ClientConfig}
-	if err := conf.Unmarshal(&decoded); err != nil {
-		return err
-	}
-
-	c.ClientConfig = decoded.ClientConfig
-	c.Endpoints = decoded.Endpoints
-	c.User = decoded.User
-	c.Password = decoded.Password
-	c.APIKey = decoded.APIKey
-
-	return nil
 }
 
 type configWithoutUnmarshal Config
