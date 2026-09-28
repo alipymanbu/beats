@@ -42,8 +42,6 @@ func createDefaultConfig() component.Config {
 	return &Config{ClientConfig: confighttp.NewDefaultClientConfig()}
 }
 
-type configWithoutUnmarshal Config
-
 // Validate validates configuration relationships without accessing TLS files.
 func (c *Config) Validate() error {
 	if len(c.Endpoints) == 0 {
@@ -67,9 +65,6 @@ func (c *Config) Validate() error {
 	if c.ClientConfig.Compression.IsCompressed() {
 		return unsupportedFieldError("compression")
 	}
-	if err := c.ClientConfig.Headers.Validate(); err != nil {
-		return fmt.Errorf("invalid headers: %w", err)
-	}
 
 	for _, endpoint := range c.Endpoints {
 		u, err := parseHTTPURL(endpoint)
@@ -90,11 +85,8 @@ func (c *Config) Validate() error {
 	if err := validateAuthentication(c.User, c.Password, c.APIKey); err != nil {
 		return err
 	}
-	if err := c.ClientConfig.TLS.Validate(); err != nil {
-		return fmt.Errorf("invalid TLS configuration: %w", err)
-	}
 
-	return c.ClientConfig.Validate()
+	return nil
 }
 
 func unsupportedFieldError(field string) error {

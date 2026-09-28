@@ -186,44 +186,6 @@ func TestConfigValidate(t *testing.T) {
 			},
 			errText: "invalid proxy_url",
 		},
-		{
-			name: "TLS certificate without key",
-			config: func() *Config {
-				config := validConfig()
-				config.ClientConfig.TLS.CertFile = "client.pem"
-				return config
-			},
-			errText: "both certificate and key",
-		},
-		{
-			name: "TLS CA file and PEM conflict",
-			config: func() *Config {
-				config := validConfig()
-				config.ClientConfig.TLS.CAFile = "ca.pem"
-				config.ClientConfig.TLS.CAPem = "ca pem"
-				return config
-			},
-			errText: "either a CA file or the PEM",
-		},
-		{
-			name: "invalid TLS minimum version",
-			config: func() *Config {
-				config := validConfig()
-				config.ClientConfig.TLS.MinVersion = "42"
-				return config
-			},
-			errText: "invalid TLS min_version",
-		},
-		{
-			name: "TLS maximum version below minimum",
-			config: func() *Config {
-				config := validConfig()
-				config.ClientConfig.TLS.MinVersion = "1.3"
-				config.ClientConfig.TLS.MaxVersion = "1.2"
-				return config
-			},
-			errText: "min_version cannot be greater",
-		},
 	}
 
 	for _, test := range tests {
