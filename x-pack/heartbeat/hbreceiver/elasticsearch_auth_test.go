@@ -9,12 +9,14 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.elastic.co/apm/v2/apmtest"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/receiver"
@@ -54,15 +56,17 @@ func (r *closableRoundTripper) CloseIdleConnections() {
 }
 
 type fakeElasticsearchAuthExtension struct {
-	endpoints    []string
-	roundTripper http.RoundTripper
-	roundTripErr error
+	endpoints        []string
+	roundTripper     http.RoundTripper
+	roundTripErr     error
+	baseRoundTripper http.RoundTripper
 }
 
 func (f *fakeElasticsearchAuthExtension) Start(context.Context, component.Host) error { return nil }
 func (f *fakeElasticsearchAuthExtension) Shutdown(context.Context) error              { return nil }
 func (f *fakeElasticsearchAuthExtension) Endpoints() []string                         { return f.endpoints }
-func (f *fakeElasticsearchAuthExtension) RoundTripper(http.RoundTripper) (http.RoundTripper, error) {
+func (f *fakeElasticsearchAuthExtension) RoundTripper(base http.RoundTripper) (http.RoundTripper, error) {
+	f.baseRoundTripper = base
 	return f.roundTripper, f.roundTripErr
 }
 
@@ -118,6 +122,40 @@ func TestElasticsearchAuthStartHookErrors(t *testing.T) {
 
 func TestElasticsearchAuthStartHookEmptyReference(t *testing.T) {
 	require.NoError(t, elasticsearchAuthStartHook(t.Context(), "", nil, "", func(*esClient) {})(nil), "empty Elasticsearch auth reference should be a no-op")
+}
+
+func TestESClientTransportComposition(t *testing.T) {
+	returnedTransport := &closableRoundTripper{
+		roundTripperFunc: func(*http.Request) (*http.Response, error) {
+			return nil, nil
+		},
+		closed: make(chan struct{}),
+	}
+	auth := &fakeElasticsearchAuthExtension{
+		endpoints:    []string{"http://example.test"},
+		roundTripper: returnedTransport,
+	}
+
+	client, err := newESClient(t.Context(), auth, "Heartbeat/test-agent")
+	require.NoError(t, err, "client creation")
+	require.NotNil(t, auth.baseRoundTripper, "elasticsearchauth should receive a base transport")
+	assert.NotSame(t, http.DefaultTransport, auth.baseRoundTripper, "the base transport should be wrapped")
+	assert.Same(t, returnedTransport, client.client.Transport, "the transport returned by elasticsearchauth should be installed directly")
+
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+
+	_, spans, apmErrors := apmtest.WithTransaction(func(ctx context.Context) {
+		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_search", nil)
+		require.NoError(t, requestErr, "creating request for the base transport")
+		response, roundTripErr := auth.baseRoundTripper.RoundTrip(request)
+		require.NoError(t, roundTripErr, "APM-wrapped base transport should complete the request")
+		require.NoError(t, response.Body.Close(), "closing the instrumented response body")
+	})
+	assert.Empty(t, apmErrors, "APM instrumentation should not report errors")
+	require.Len(t, spans, 1, "the base transport should create exactly one APM span")
+	assert.Equal(t, "db", spans[0].Type, "the base transport should create a database span")
+	assert.Equal(t, "elasticsearch", spans[0].Subtype, "the base transport should use Elasticsearch APM instrumentation")
 }
 
 func TestESClientRequest(t *testing.T) {

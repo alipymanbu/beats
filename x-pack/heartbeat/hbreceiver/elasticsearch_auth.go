@@ -108,14 +108,18 @@ func newESClient(ctx context.Context, auth elasticsearchAuthExtension, userAgent
 		parsedEndpoints = append(parsedEndpoints, parsedEndpoint)
 	}
 
-	roundTripper, err := auth.RoundTripper(http.DefaultTransport)
+	// Keep Elasticsearch requests instrumented the same way as eslegclient.
+	// When elasticsearchauth delegates to beatsauth, beatsauth ignores this base
+	// and returns its own APM-instrumented transport, which is installed directly
+	// below so the delegated path is not instrumented twice.
+	baseTransport := apmelasticsearch.WrapRoundTripper(http.DefaultTransport)
+	roundTripper, err := auth.RoundTripper(baseTransport)
 	if err != nil {
 		return nil, fmt.Errorf("creating authenticated transport: %w", err)
 	}
 	if userAgent == "" {
 		userAgent = useragent.UserAgent("Heartbeat", version.GetDefaultVersion(), version.Commit(), version.BuildTime().String())
 	}
-	// Keep Elasticsearch requests instrumented the same way as eslegclient.
 	return &esClient{
 		ctx:       ctx,
 		endpoints: parsedEndpoints,
@@ -123,7 +127,7 @@ func newESClient(ctx context.Context, auth elasticsearchAuthExtension, userAgent
 		// elasticsearchauth intentionally does not own request deadlines; Heartbeat
 		// keeps the 10-second deadline used by its prior Elasticsearch requester.
 		client: &http.Client{
-			Transport: apmelasticsearch.WrapRoundTripper(roundTripper),
+			Transport: roundTripper,
 			Timeout:   elasticsearchRequestTimeout,
 		},
 	}, nil
