@@ -109,7 +109,7 @@ func TestElasticsearchAuthStartHookErrors(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := elasticsearchAuthStartHook(test.reference, nil, "", func(*esClient) {})(test.host)
+			err := elasticsearchAuthStartHook(t.Context(), test.reference, nil, "", func(*esClient) {})(test.host)
 			require.Error(t, err, "start hook should reject an invalid Elasticsearch authentication extension")
 			assert.Contains(t, err.Error(), test.wantError, "start hook should return the expected resolver error")
 		})
@@ -117,7 +117,7 @@ func TestElasticsearchAuthStartHookErrors(t *testing.T) {
 }
 
 func TestElasticsearchAuthStartHookEmptyReference(t *testing.T) {
-	require.NoError(t, elasticsearchAuthStartHook("", nil, "", func(*esClient) {})(nil), "empty Elasticsearch auth reference should be a no-op")
+	require.NoError(t, elasticsearchAuthStartHook(t.Context(), "", nil, "", func(*esClient) {})(nil), "empty Elasticsearch auth reference should be a no-op")
 }
 
 func TestESClientRequest(t *testing.T) {
@@ -135,7 +135,7 @@ func TestESClientRequest(t *testing.T) {
 		}),
 	}
 
-	client, err := newESClient(auth, "Heartbeat/test-agent")
+	client, err := newESClient(t.Context(), auth, "Heartbeat/test-agent")
 	require.NoError(t, err, "client creation")
 	assert.Equal(t, elasticsearchRequestTimeout, client.client.Timeout, "Heartbeat must own the Elasticsearch request deadline")
 	status, body, err := client.Request(http.MethodPost, "/_search?size=1", "pipeline", map[string]string{"routing": "monitor"}, map[string]string{"query": "state"})
@@ -174,7 +174,7 @@ func TestESClientRequestConfiguredHeadersOverrideDefaults(t *testing.T) {
 		}),
 	}
 
-	client, err := newESClient(auth, "Heartbeat/test-agent")
+	client, err := newESClient(t.Context(), auth, "Heartbeat/test-agent")
 	require.NoError(t, err, "client creation")
 	_, _, err = client.Request(http.MethodGet, "/", "", nil, nil)
 	require.NoError(t, err, "request should succeed")
@@ -198,7 +198,7 @@ func TestESClientRequestNon2xx(t *testing.T) {
 		}),
 	}
 
-	client, err := newESClient(auth, "")
+	client, err := newESClient(t.Context(), auth, "")
 	require.NoError(t, err, "client creation")
 	status, body, err := client.Request(http.MethodGet, "/", "", nil, nil)
 	require.EqualError(t, err, `418 I'm a teapot: Brewing error`, "unexpected error message")
@@ -273,6 +273,88 @@ func TestElasticsearchAuthStartHookInjectsBeforeRun(t *testing.T) {
 	shutdownCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	require.NoError(t, rec.Shutdown(shutdownCtx), "shutting down the Heartbeat receiver should succeed")
+	select {
+	case <-transport.closed:
+	case <-time.After(time.Second):
+		t.Fatal("Heartbeat did not close idle Elasticsearch connections")
+	}
+}
+
+func TestElasticsearchAuthShutdownCancelsInFlightRequest(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestDone := make(chan error, 1)
+	var startOnce sync.Once
+	transport := &closableRoundTripper{
+		closed: make(chan struct{}),
+		roundTripperFunc: func(req *http.Request) (*http.Response, error) {
+			startOnce.Do(func() { close(requestStarted) })
+			<-req.Context().Done()
+			select {
+			case requestDone <- req.Context().Err():
+			default:
+			}
+			return nil, req.Context().Err()
+		},
+	}
+	extensionID := component.MustNewIDWithName("elasticsearchauth", "_agent-component/default")
+	extension := &fakeElasticsearchAuthExtension{
+		endpoints:    []string{"http://example.test"},
+		roundTripper: transport,
+	}
+	host := elasticsearchAuthTestHost{extensions: map[component.ID]component.Component{
+		extensionID: extension,
+	}}
+	cfg := &Config{
+		ElasticsearchAuth: extensionID.String(),
+		Beatconfig: map[string]any{
+			"heartbeat": map[string]any{
+				"monitors": []map[string]any{
+					{
+						"type":     "tcp",
+						"id":       "elasticsearch-auth-cancel",
+						"schedule": "@every 100ms",
+						"hosts":    []string{"localhost:0"},
+					},
+				},
+			},
+			"management.otel.enabled": true,
+			"path.home":               t.TempDir(),
+			"queue.mem.flush.timeout": "0s",
+		},
+	}
+	factory := NewFactoryWithSettings(Settings{Home: t.TempDir()})
+	settings := receiver.Settings{
+		ID: component.NewIDWithName(factory.Type(), "elasticsearch-auth-cancel"),
+		TelemetrySettings: component.TelemetrySettings{
+			Logger: zap.NewNop(),
+		},
+	}
+
+	rec, err := factory.CreateLogs(t.Context(), settings, cfg, consumertest.NewNop())
+	require.NoError(t, err, "creating the Heartbeat receiver should succeed")
+
+	require.NoError(t, rec.Start(t.Context(), host), "starting the Heartbeat receiver should succeed")
+	select {
+	case <-requestStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Heartbeat did not start the in-flight Elasticsearch request")
+	}
+
+	shutdownStart := time.Now()
+	shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, rec.Shutdown(shutdownCtx), "shutting down the Heartbeat receiver should succeed")
+	shutdownDuration := time.Since(shutdownStart)
+
+	assert.Less(t, shutdownDuration, 5*time.Second, "shutdown should release the request promptly rather than waiting for the HTTP timeout")
+
+	select {
+	case err := <-requestDone:
+		assert.ErrorIs(t, err, context.Canceled, "in-flight request should be released due to context cancellation")
+	case <-time.After(time.Second):
+		t.Fatal("in-flight request did not record completion")
+	}
+
 	select {
 	case <-transport.closed:
 	case <-time.After(time.Second):

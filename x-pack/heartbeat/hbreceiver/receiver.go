@@ -15,7 +15,18 @@ import (
 
 type heartbeatReceiver struct {
 	xpInstance.BeatReceiver
+	ctx                        context.Context
+	cancel                     context.CancelFunc
 	elasticsearchAuthRequester *esClient
+}
+
+func newHeartbeatReceiver(br xpInstance.BeatReceiver) *heartbeatReceiver {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &heartbeatReceiver{
+		BeatReceiver: br,
+		ctx:          ctx,
+		cancel:       cancel,
+	}
 }
 
 func (hb *heartbeatReceiver) Start(_ context.Context, host component.Host) error {
@@ -30,6 +41,9 @@ func (hb *heartbeatReceiver) Start(_ context.Context, host component.Host) error
 
 func (hb *heartbeatReceiver) Shutdown(ctx context.Context) error {
 	hb.Logger.Info("stopping heartbeat receiver")
+	if hb.cancel != nil {
+		hb.cancel()
+	}
 	defer func() {
 		if hb.elasticsearchAuthRequester != nil {
 			hb.elasticsearchAuthRequester.CloseIdleConnections()

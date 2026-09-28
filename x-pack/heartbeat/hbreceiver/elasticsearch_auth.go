@@ -6,6 +6,7 @@ package hbreceiver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,6 +36,7 @@ type elasticsearchAuthExtension interface {
 }
 
 type esClient struct {
+	ctx       context.Context
 	endpoints []*url.URL
 	client    *http.Client
 	userAgent string
@@ -43,7 +45,14 @@ type esClient struct {
 
 var _ monitorstate.ElasticsearchRequester = (*esClient)(nil)
 
-func elasticsearchAuthStartHook(reference string, heartbeat *beater.Heartbeat, userAgent string, setRequester func(*esClient)) func(component.Host) error {
+func elasticsearchAuthStartHook(
+	ctx context.Context,
+	reference string,
+	heartbeat *beater.Heartbeat,
+	userAgent string,
+	setRequester func(*esClient),
+) func(component.Host) error {
+
 	return func(host component.Host) error {
 		if reference == "" {
 			return nil
@@ -71,7 +80,7 @@ func elasticsearchAuthStartHook(reference string, heartbeat *beater.Heartbeat, u
 			return fmt.Errorf("heartbeat instance was not captured for elasticsearch_auth extension %q", extensionID.String())
 		}
 
-		requester, err := newESClient(auth, userAgent)
+		requester, err := newESClient(ctx, auth, userAgent)
 		if err != nil {
 			return fmt.Errorf("creating Elasticsearch requester from extension %q: %w", extensionID.String(), err)
 		}
@@ -81,7 +90,10 @@ func elasticsearchAuthStartHook(reference string, heartbeat *beater.Heartbeat, u
 	}
 }
 
-func newESClient(auth elasticsearchAuthExtension, userAgent string) (*esClient, error) {
+func newESClient(ctx context.Context, auth elasticsearchAuthExtension, userAgent string) (*esClient, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	endpoints := auth.Endpoints()
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("extension has no endpoints")
@@ -105,6 +117,7 @@ func newESClient(auth elasticsearchAuthExtension, userAgent string) (*esClient, 
 	}
 	// Keep Elasticsearch requests instrumented the same way as eslegclient.
 	return &esClient{
+		ctx:       ctx,
 		endpoints: parsedEndpoints,
 		userAgent: userAgent,
 		// elasticsearchauth intentionally does not own request deadlines; Heartbeat
@@ -133,8 +146,11 @@ func (e *esClient) Request(method, path, pipeline string, params map[string]stri
 	var requestErr error
 	for offset := range len(e.endpoints) {
 		endpoint := requestURL(e.endpoints[(start+offset)%len(e.endpoints)], path, pipeline, params)
-		//nolint:noctx // The interface we're implementing does not accept a context and the HTTP client has a timeout set
-		request, err := http.NewRequest(method, endpoint.String(), bytes.NewReader(encodedBody))
+		reqCtx := e.ctx
+		if reqCtx == nil {
+			reqCtx = context.Background()
+		}
+		request, err := http.NewRequestWithContext(reqCtx, method, endpoint.String(), bytes.NewReader(encodedBody))
 		if err != nil {
 			return 0, nil, fmt.Errorf("creating Elasticsearch request: %w", err)
 		}
