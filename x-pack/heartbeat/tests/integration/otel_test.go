@@ -11,8 +11,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,15 +88,31 @@ func TestHeartbeatOTelElasticsearchAuthLoadsMonitorState(t *testing.T) {
 	}))
 	t.Cleanup(target.Close)
 
+	esBackend := esHost
+	esBackend.User = nil
+	tlsElasticsearch := httptest.NewTLSServer(httputil.NewSingleHostReverseProxy(&esBackend))
+	t.Cleanup(tlsElasticsearch.Close)
+
+	proxy := &recordingConnectProxy{}
+	proxyServer := httptest.NewServer(proxy)
+	t.Cleanup(proxyServer.Close)
+
 	collectorConfig := fmt.Sprintf(`extensions:
-  elasticsearchauth/default:
+  beatsauth/state:
+    proxy_url: %s
+    idle_connection_timeout: 1s
+    ssl:
+      verification_mode: none
+  elasticsearchauth/state:
     endpoints:
       - %s
     user: %s
     password: %s
+    auth:
+      authenticator: beatsauth/state
 receivers:
   heartbeatreceiver:
-    elasticsearch_auth: elasticsearchauth/default
+    elasticsearch_auth: elasticsearchauth/state
     heartbeat:
       monitors:
         - type: http
@@ -112,9 +132,10 @@ receivers:
     management.otel.enabled: true
 exporters:
   elasticsearch/log:
-    endpoint: %s
-    auth:
-      authenticator: elasticsearchauth/default
+    endpoints:
+      - %s
+    user: %s
+    password: %s
     compression: none
     logs_index: %s
     sending_queue:
@@ -123,7 +144,8 @@ exporters:
         flush_timeout: 1s
 service:
   extensions:
-    - elasticsearchauth/default
+    - beatsauth/state
+    - elasticsearchauth/state
   pipelines:
     logs:
       receivers:
@@ -136,7 +158,8 @@ service:
     metrics:
       level: none
 `,
-		esURL,
+		proxyServer.URL,
+		tlsElasticsearch.URL,
 		esUser,
 		esPassword,
 		monitorID,
@@ -144,6 +167,8 @@ service:
 		target.URL,
 		t.TempDir(),
 		esURL,
+		esUser,
+		esPassword,
 		eventIndex,
 	)
 
@@ -194,4 +219,65 @@ service:
 		time.Second,
 		"timed out waiting for Heartbeat to load and use monitor state",
 	)
+
+	assert.Positive(t, proxy.connects.Load(), "Heartbeat state loading must connect to Elasticsearch through beatsauth's configured proxy")
+}
+
+type recordingConnectProxy struct {
+	connects atomic.Uint64
+}
+
+func (p *recordingConnectProxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodConnect {
+		http.Error(writer, "only CONNECT is supported", http.StatusMethodNotAllowed)
+		return
+	}
+
+	dialCtx, dialCancel := context.WithTimeout(request.Context(), 10*time.Second)
+	defer dialCancel()
+
+	destination, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", request.Host)
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	hijacker, ok := writer.(http.Hijacker)
+	if !ok {
+		_ = destination.Close()
+		http.Error(writer, "hijacking is unsupported", http.StatusInternalServerError)
+		return
+	}
+	client, bufferedClient, err := hijacker.Hijack()
+	if err != nil {
+		_ = destination.Close()
+		return
+	}
+
+	if _, err := bufferedClient.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		_ = client.Close()
+		_ = destination.Close()
+		return
+	}
+	if err := bufferedClient.Flush(); err != nil {
+		_ = client.Close()
+		_ = destination.Close()
+		return
+	}
+	p.connects.Add(1)
+
+	copyDone := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(destination, bufferedClient)
+		copyDone <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(client, destination)
+		copyDone <- struct{}{}
+	}()
+
+	<-copyDone
+	_ = client.Close()
+	_ = destination.Close()
+	<-copyDone
 }
