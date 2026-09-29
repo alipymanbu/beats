@@ -6,6 +6,7 @@ package elasticsearchauth
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -118,7 +119,8 @@ func (a *authenticatedRoundTripper) RoundTrip(request *http.Request) (*http.Resp
 		clonedRequest.Header.Set(name, string(value))
 	}
 	if a.config.APIKey != "" {
-		clonedRequest.Header.Set("Authorization", "ApiKey "+string(a.config.APIKey))
+		encodedAPIKey := base64.StdEncoding.EncodeToString([]byte(a.config.APIKey))
+		clonedRequest.Header.Set("Authorization", "ApiKey "+encodedAPIKey)
 	} else if a.config.User != "" {
 		clonedRequest.SetBasicAuth(a.config.User, string(a.config.Password))
 	}
